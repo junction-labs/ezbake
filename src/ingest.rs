@@ -18,24 +18,26 @@ use kube::{
 
 use tokio::sync::broadcast;
 use tracing::trace;
-use xds_api::pb::envoy::{
-    config::{
-        cluster::v3 as xds_cluster,
-        core::v3::{self as xds_core},
-        endpoint::v3 as xds_endpoint,
-        listener::v3 as xds_listener,
-        route::v3 as xds_route,
+use xds_api::pb::{
+    envoy::{
+        config::{
+            cluster::v3 as xds_cluster,
+            core::v3::{self as xds_core},
+            endpoint::v3 as xds_endpoint,
+            listener::v3 as xds_listener,
+            route::v3 as xds_route,
+        },
+        extensions::filters::{
+            http::router::v3 as xds_http_filter,
+            network::http_connection_manager::v3::{self as xds_http, HttpFilter},
+        },
     },
-    extensions::filters::{
-        http::router::v3 as xds_http_filter,
-        network::http_connection_manager::v3::{self as xds_http, HttpFilter},
-    },
+    google::protobuf,
 };
-use xds_api::pb::google::protobuf::Any as ProtoAny;
 
 use crate::{
     k8s::{namespace_and_name, ref_namespace_and_name, ChangedObjects, KubeResource},
-    xds::{to_any, SnapshotWriter},
+    xds::SnapshotWriter,
 };
 
 // FIXME: what do we do about errors in conversion? just log?
@@ -99,11 +101,11 @@ impl Listeners {
     }
 
     #[allow(unused)]
-    fn route_changed(&self, _route_ref: ObjectRef<HTTPRoute>) -> (String, Option<ProtoAny>) {
+    fn route_changed(&self, _route_ref: ObjectRef<HTTPRoute>) -> (String, Option<protobuf::Any>) {
         todo!("add support for HTTPRoute")
     }
 
-    fn service_changed(&self, svc_ref: &ObjectRef<Service>) -> (String, Option<ProtoAny>) {
+    fn service_changed(&self, svc_ref: &ObjectRef<Service>) -> (String, Option<protobuf::Any>) {
         let (namespace, name) = ref_namespace_and_name(svc_ref).unwrap();
         let listener_name = listener_name(namespace, name);
 
@@ -111,7 +113,7 @@ impl Listeners {
 
         let proto = self.services.get(svc_ref).map(|svc| {
             let listener = build_listener(&svc, None);
-            to_any(listener).expect("constructed invalid Listener")
+            protobuf::Any::from_msg(&listener).expect("constructed invalid Listener")
         });
 
         (listener_name, proto)
@@ -158,7 +160,7 @@ impl Clusters {
         }
     }
 
-    fn service_changed(&self, svc_ref: &ObjectRef<Service>) -> (String, Option<ProtoAny>) {
+    fn service_changed(&self, svc_ref: &ObjectRef<Service>) -> (String, Option<protobuf::Any>) {
         let (namespace, name) = ref_namespace_and_name(svc_ref).unwrap();
         let cluster_name = cluster_name(namespace, name);
 
@@ -166,7 +168,7 @@ impl Clusters {
 
         let proto = self.services.get(svc_ref).map(|svc| {
             let cluster = build_cluster(&svc);
-            to_any(cluster).expect("build_cluster: constructed invalid Cluster")
+            protobuf::Any::from_msg(&cluster).expect("build_cluster: constructed invalid Cluster")
         });
 
         (cluster_name, proto)
@@ -252,7 +254,7 @@ impl LoadAssignments {
         &'s self,
         svc_ref: &ObjectRef<Service>,
         slice_refs: impl Iterator<Item = &'a EndpointSlice>,
-    ) -> (String, Option<ProtoAny>) {
+    ) -> (String, Option<protobuf::Any>) {
         let (namespace, name) = ref_namespace_and_name(svc_ref).unwrap();
         let name = cla_name(namespace, name);
         let proto = build_cla(svc_ref, slice_refs);
@@ -261,7 +263,7 @@ impl LoadAssignments {
 
         (
             name,
-            Some(to_any(proto).expect("built invalid ClusterLoadAssignment")),
+            Some(protobuf::Any::from_msg(&proto).expect("built invalid ClusterLoadAssignment")),
         )
     }
 }
@@ -315,16 +317,18 @@ fn build_listener(service: &Service, http_route: Option<&HTTPRoute>) -> xds_list
     let conn_manager = xds_http::HttpConnectionManager {
         route_specifier,
         http_filters: vec![HttpFilter {
-            name: "ezbake".to_string(),
+            name: "envoy.filters.http.router".to_string(),
             config_type: Some(ConfigType::TypedConfig(
-                to_any(http_router_filter).expect("invalid Router filter"),
+                protobuf::Any::from_msg(&http_router_filter).expect("invalid Router filter"),
             )),
             ..Default::default()
         }],
         ..Default::default()
     };
 
-    let api_listener = Some(to_any(conn_manager).expect("generated invald HttpConnectionManager"));
+    let api_listener = Some(
+        protobuf::Any::from_msg(&conn_manager).expect("generated invald HttpConnectionManager"),
+    );
     xds_listener::Listener {
         name: listener_name(
             service.namespace().as_ref().unwrap(),

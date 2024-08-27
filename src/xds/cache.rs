@@ -5,7 +5,7 @@ use std::sync::{
 
 use crossbeam_skiplist::SkipMap;
 use enum_map::EnumMap;
-use xds_api::pb::google::protobuf::Any as ProtoAny;
+use xds_api::pb::google::protobuf;
 
 use crate::xds::resources::ResourceType;
 
@@ -33,7 +33,7 @@ pub(crate) fn new_snapshot() -> (Snapshot, TypedWriters) {
 
 pub(crate) struct VersionedProto {
     pub version: u64,
-    pub proto: ProtoAny,
+    pub proto: protobuf::Any,
 }
 
 #[derive(Default)]
@@ -74,7 +74,7 @@ impl SnapshotWriter {
     pub fn update(
         &self,
         version: u64,
-        resources: impl Iterator<Item = (String, Option<ProtoAny>)>,
+        resources: impl Iterator<Item = (String, Option<protobuf::Any>)>,
     ) {
         let typed = &self.inner.typed[self.resource_type];
 

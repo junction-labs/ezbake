@@ -10,8 +10,6 @@ mod ingest;
 mod k8s;
 mod xds;
 
-// TODO: do CLAs
-// TODO: pick names
 // TODO: figure out multi-cluster?
 // TODO: add HTTPRoute stuff
 // TODO: actually figure out metrics/logs/etc. would be nice to have a flag that
@@ -32,6 +30,9 @@ async fn main() {
     let ads_server = xds::AdsServer::new(snapshot);
 
     let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(xds_api::FILE_DESCRIPTOR_SET)
+        .with_service_name("envoy.service.discovery.v3.AggregatedDiscoveryService")
+        .with_service_name("envoy.service.status.v3.ClientStatusDiscoveryService")
         .build()
         .unwrap();
 

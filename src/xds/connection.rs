@@ -326,7 +326,7 @@ impl<'n, 's> Iterator for SnapshotIter<'n, 's> {
 mod test {
     use super::*;
     use xds_api::pb::envoy::config::core::v3::{self as xds_core};
-    use xds_api::pb::google::protobuf::Any as ProtoAny;
+    use xds_api::pb::google::protobuf;
 
     #[test]
     fn test_init_no_data() {
@@ -776,8 +776,8 @@ mod test {
         }
     }
 
-    fn anything() -> ProtoAny {
-        ProtoAny {
+    fn anything() -> protobuf::Any {
+        protobuf::Any {
             type_url: "type_url".to_string(),
             value: vec![],
         }
