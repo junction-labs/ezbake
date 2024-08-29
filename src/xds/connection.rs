@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, num::ParseIntError};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::ParseIntError,
+};
 
 use enum_map::EnumMap;
 use xds_api::pb::envoy::{
@@ -19,11 +22,28 @@ pub(crate) struct AdsConnection {
 
 #[derive(Debug, Default)]
 struct AdsSubscription {
+    // the names that the client is subscribed to
     resource_names: ResourceNames,
+
+    // the version of the last response sent
     last_sent_version: Option<u64>,
+
+    // the nonce of the last reseponse sent
     last_sent_nonce: Option<u64>,
+
+    // the last version of each resource sent back to the client
+    //
+    // this isn't used to verify what resources were sent for LDS/CDS, but is
+    // kept to track state for CSDS.
+    sent: BTreeMap<String, u64>,
+
+    // whether or not the client applied the last response
     applied: bool,
+
+    // the last version a client successfully ACK'd
     last_ack_version: Option<u64>,
+
+    // the last nonce a client successfully ACK'd
     last_ack_nonce: Option<u64>,
 }
 
@@ -69,6 +89,11 @@ impl AdsConnection {
             return (None, Vec::new());
         };
 
+        // check that the request is not stale
+        if request_nonce != sub.last_sent_nonce {
+            return (None, Vec::new());
+        }
+
         // if this isn't the initial request on a stream, update some state
         if request_nonce.is_some() {
             if is_nack(&request) {
@@ -80,8 +105,6 @@ impl AdsConnection {
             }
         }
 
-        // get into sending an update.
-        //
         // updates should always go out if the version requested by the client
         // isn't the current version.
         let out_of_date = request_version != Some(self.snapshot.version(rtype));
@@ -89,15 +112,8 @@ impl AdsConnection {
         // update the current subscription's resource names. if the names have
         // changed replace the current connection's names. send an update if
         // names change at all.
-        //
-        // TODO: we could potentially avoid sending some updates here if the
-        // resource names didn't change by tracking the names SENT to every
-        // client in addition to the names it was subscribed to, or doing what
-        // go-control-plane seems to do and only sending updates on additive
-        // name changes.
         let resource_names = ResourceNames::from_names(&sub.resource_names, request.resource_names);
         let names_changed = sub.resource_names != resource_names;
-
         if names_changed {
             sub.resource_names = resource_names;
         }
@@ -161,6 +177,8 @@ impl AdsSubscription {
         let mut resources = Vec::with_capacity(size_hint);
 
         for entry in iter {
+            self.sent
+                .insert(entry.key().to_string(), entry.value().version);
             resources.push(entry.value().proto.clone());
         }
 
@@ -194,11 +212,16 @@ impl AdsSubscription {
         let mut last_nonce = 0;
         let mut responses = Vec::with_capacity(size_hint);
         for entry in iter {
+            let name = entry.key();
             let resource = entry.value();
+
             if self
-                .last_sent_version
-                .map_or(true, |lsv| resource.version > lsv)
+                .sent
+                .get(name)
+                .map_or(true, |lsv| resource.version > *lsv)
             {
+                self.sent
+                    .insert(entry.key().to_string(), entry.value().version);
                 responses.push(DiscoveryResponse {
                     type_url: rtype.type_url().to_string(),
                     version_info: resource.version.to_string(),
@@ -615,7 +638,7 @@ mod test {
     }
 
     #[test]
-    fn test_handle_ack_as_update_eds() {
+    fn test_eds_update_remove_subscription() {
         let node = Some(xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
@@ -697,6 +720,85 @@ mod test {
             vec!["default/nginx-staging/endpoints"],
         ));
         assert!(resp.is_empty());
+    }
+
+    #[test]
+    fn test_eds_update_add_subscription() {
+        let node = Some(xds_core::Node {
+            id: "test-node".to_string(),
+            ..Default::default()
+        });
+
+        let snapshot = new_snapshot([
+            (ResourceType::Listener, 123, vec!["default/nginx"]),
+            (
+                ResourceType::Cluster,
+                123,
+                vec!["default/nginx/cluster", "default/nginx-staging/cluster"],
+            ),
+            (
+                ResourceType::ClusterLoadAssignment,
+                123,
+                vec!["default/nginx/endpoints", "default/nginx-staging/endpoints"],
+            ),
+        ]);
+
+        let (mut conn, _, resp) = AdsConnection::from_initial_request(
+            discovery_request(
+                ResourceType::ClusterLoadAssignment,
+                node.clone(),
+                "",
+                "",
+                vec!["default/nginx/endpoints"],
+            ),
+            snapshot.clone(),
+        )
+        .unwrap();
+
+        // should return a single response
+        assert_eq!(resp.len(), 1);
+        assert!(
+            resp.iter()
+                .all(|msg| msg.type_url == ResourceType::ClusterLoadAssignment.type_url()),
+            "should be EDS resources",
+        );
+        assert!(
+            resp.iter().all(|msg| msg.resources.len() == 1),
+            "should contain a single response",
+        );
+
+        // should ignore a stale incoming request
+        let (_, resp) = conn.handle_ads_request(discovery_ack(
+            ResourceType::ClusterLoadAssignment,
+            "",
+            "",
+            vec![
+                "default/nginx-staging/endpoints",
+                "default/nginx/endpoints",
+                "stale/stale/stale",
+                "stale/staler/stalest",
+            ],
+        ));
+        assert!(resp.is_empty());
+
+        // should handle the next request. incremental means returning
+        // only the data for new names.
+        let (_, resp) = conn.handle_ads_request(discovery_ack(
+            ResourceType::ClusterLoadAssignment,
+            "123",
+            &conn.nonce.to_string(),
+            vec!["default/nginx-staging/endpoints", "default/nginx/endpoints"],
+        ));
+        assert_eq!(resp.len(), 1);
+        assert!(
+            resp.iter()
+                .all(|msg| msg.type_url == ResourceType::ClusterLoadAssignment.type_url()),
+            "should be EDS resources",
+        );
+        assert!(
+            resp.iter().all(|msg| msg.resources.len() == 1),
+            "should contain a single response",
+        );
     }
 
     fn new_snapshot(
