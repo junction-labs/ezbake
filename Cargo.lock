@@ -2298,12 +2298,11 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "xds-api"
 version = "0.1.0"
-source = "git+ssh://git@github.com/junction-labs/api.git#7bf02b91867de285ab5d6b85a2abe7641a4130bf"
+source = "git+ssh://git@github.com/junction-labs/xds-api.git#a222ce06bcb42848c3c805a3d634adecd4aa10bb"
 dependencies = [
  "enum-map",
  "once_cell",
  "prost",
- "serde",
  "tonic",
 ]
 
