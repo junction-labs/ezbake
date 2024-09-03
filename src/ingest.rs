@@ -65,10 +65,8 @@ impl VersionCounter {
 pub(crate) struct Listeners {
     version_counter: VersionCounter,
     services: Store<Service>,
-    // routes: Store<HTTPRoute>,
     writer: SnapshotWriter,
     service_changed: broadcast::Receiver<ChangedObjects<Service>>,
-    // routes_changed: Receiver<ChangedObjects<HTTPRoute>>,
 }
 
 impl Listeners {

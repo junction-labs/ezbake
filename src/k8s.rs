@@ -87,9 +87,13 @@ impl KubeResource for EndpointSlice {
         self.managed_fields_mut().clear();
     }
 
-    fn has_changed(&self, _other: &Self) -> bool {
-        // FIXME
-        true
+    fn has_changed(&self, other: &Self) -> bool {
+        check_changed!(self.meta().labels, other.meta().labels);
+        check_changed!(self.ports, other.ports);
+        // FIXME: this doesn't check for ordering changes. not sure how often those happen.
+        check_changed!(self.endpoints, other.endpoints);
+
+        false
     }
 }
 
