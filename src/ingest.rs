@@ -17,7 +17,7 @@ use kube::{
 };
 
 use tokio::sync::broadcast;
-use tracing::trace;
+use tracing::{info, trace};
 use xds_api::pb::{
     envoy::{
         config::{
@@ -98,11 +98,6 @@ impl Listeners {
         }
     }
 
-    #[allow(unused)]
-    fn route_changed(&self, _route_ref: ObjectRef<HTTPRoute>) -> (String, Option<protobuf::Any>) {
-        todo!("add support for HTTPRoute")
-    }
-
     fn service_changed(&self, svc_ref: &ObjectRef<Service>) -> (String, Option<protobuf::Any>) {
         let (namespace, name) = ref_namespace_and_name(svc_ref).unwrap();
         let listener_name = listener_name(namespace, name);
@@ -164,10 +159,18 @@ impl Clusters {
 
         trace!(svc = %svc_ref, cluster = %cluster_name, "building Cluster");
 
-        let proto = self.services.get(svc_ref).map(|svc| {
-            let cluster = build_cluster(&svc);
-            protobuf::Any::from_msg(&cluster).expect("build_cluster: constructed invalid Cluster")
-        });
+        // FIXME: this is truly terrible error reporting.
+        let proto = match self.services.get(svc_ref).map(|s| build_cluster(&s)) {
+            Some(Some(cluster)) => Some(
+                protobuf::Any::from_msg(&cluster)
+                    .expect("invalid Cluster config: check svc annotations"),
+            ),
+            Some(None) => {
+                info!(svc = %svc_ref, "invalid Cluster config");
+                None
+            }
+            None => None,
+        };
 
         (cluster_name, proto)
     }
@@ -301,9 +304,13 @@ fn build_listener(service: &Service, http_route: Option<&HTTPRoute>) -> xds_list
     let (namespace, name) = namespace_and_name(service).expect("service missing namespace/name");
 
     let dns_name = listener_name(namespace, name);
-    let virtual_hosts = http_route
-        .map(build_vhosts)
-        .unwrap_or_else(|| default_vhosts(&dns_name, cluster_name(namespace, name)));
+    let virtual_hosts = http_route.map(build_vhosts).unwrap_or_else(|| {
+        default_vhosts(
+            &dns_name,
+            cluster_name(namespace, name),
+            annotation_hash_policies(&service),
+        )
+    });
 
     let route_specifier = Some(RouteSpecifier::RouteConfig(xds_route::RouteConfiguration {
         name: route_config_name(namespace, name),
@@ -341,7 +348,35 @@ fn build_vhosts(_http_route: &HTTPRoute) -> Vec<xds_route::VirtualHost> {
     todo!("implement Gateway API support")
 }
 
-fn default_vhosts(dns_name: &str, cluster: String) -> Vec<xds_route::VirtualHost> {
+fn annotation_hash_policies(svc: &Service) -> Vec<xds_route::route_action::HashPolicy> {
+    use xds_route::route_action::hash_policy::Header;
+    use xds_route::route_action::hash_policy::PolicySpecifier;
+    use xds_route::route_action::HashPolicy;
+
+    let mut policies = Vec::new();
+
+    if let Some(header_names) = svc.annotations().get("junctionlabs.io/hash-header") {
+        let cleaned_names = header_names.split(',').map(|s| s.trim().to_string());
+
+        let header_policies = cleaned_names.map(|name| HashPolicy {
+            terminal: false,
+            policy_specifier: Some(PolicySpecifier::Header(Header {
+                header_name: name,
+                regex_rewrite: None,
+            })),
+        });
+
+        policies.extend(header_policies);
+    }
+
+    policies
+}
+
+fn default_vhosts(
+    dns_name: &str,
+    cluster: String,
+    hash_policy: Vec<xds_route::route_action::HashPolicy>,
+) -> Vec<xds_route::VirtualHost> {
     use xds_route::route::Action;
     use xds_route::route_action::ClusterSpecifier;
     use xds_route::route_match::PathSpecifier;
@@ -349,6 +384,7 @@ fn default_vhosts(dns_name: &str, cluster: String) -> Vec<xds_route::VirtualHost
     let path_specifier = PathSpecifier::Prefix(String::new());
     let action = Action::Route(xds_route::RouteAction {
         cluster_specifier: Some(ClusterSpecifier::Cluster(cluster)),
+        hash_policy,
         ..Default::default()
     });
 
@@ -368,24 +404,74 @@ fn default_vhosts(dns_name: &str, cluster: String) -> Vec<xds_route::VirtualHost
     }]
 }
 
-fn build_cluster(svc: &Service) -> xds_cluster::Cluster {
+fn build_cluster(svc: &Service) -> Option<xds_cluster::Cluster> {
     use xds_cluster::cluster::ClusterDiscoveryType;
     use xds_cluster::cluster::DiscoveryType;
     use xds_cluster::cluster::EdsClusterConfig;
-    use xds_cluster::cluster::LbPolicy;
 
     let (namespace, name) =
         namespace_and_name(svc).expect("build_cluster: service missing namespace and name");
 
-    xds_cluster::Cluster {
+    let Some((lb_policy, lb_config)) = lb_config_from(svc.annotations()) else {
+        return None;
+    };
+
+    Some(xds_cluster::Cluster {
         name: cluster_name(namespace, name),
-        lb_policy: LbPolicy::RoundRobin.into(),
+        lb_policy: lb_policy.into(),
+        lb_config: Some(lb_config),
         cluster_discovery_type: Some(ClusterDiscoveryType::Type(DiscoveryType::Eds.into())),
         eds_cluster_config: Some(EdsClusterConfig {
             eds_config: Some(ads_config_source()),
             service_name: cla_name(namespace, name),
         }),
         ..Default::default()
+    })
+}
+
+/// parse an LbConfig from annotations.
+///
+/// returns `None` if there was a problem parsing or an unsupported policy was
+/// specified, but defaults to RoundRobin if no policy was specified.
+fn lb_config_from(
+    annotations: &BTreeMap<String, String>,
+) -> Option<(
+    xds_cluster::cluster::LbPolicy,
+    xds_cluster::cluster::LbConfig,
+)> {
+    use xds_cluster::cluster::ring_hash_lb_config::HashFunction;
+    use xds_cluster::cluster::LbConfig;
+    use xds_cluster::cluster::LbPolicy;
+    use xds_cluster::cluster::RingHashLbConfig;
+
+    match annotations
+        .get("junctionlabs.io/lb-strategy")
+        .map(|s| LbPolicy::from_str_name(s))
+    {
+        None | Some(Some(LbPolicy::RoundRobin)) => Some((
+            LbPolicy::RoundRobin,
+            LbConfig::RoundRobinLbConfig(Default::default()),
+        )),
+        Some(Some(LbPolicy::RingHash)) => {
+            let min_size: u64 = annotations
+                .get("junctionlabs.io/ring-hash-min-size")
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(128);
+            let max_size: u64 = annotations
+                .get("junctionlabs.io/ring-hash-max-size")
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(1024);
+
+            Some((
+                LbPolicy::RingHash,
+                LbConfig::RingHashLbConfig(RingHashLbConfig {
+                    minimum_ring_size: Some(min_size.into()),
+                    maximum_ring_size: Some(max_size.into()),
+                    hash_function: HashFunction::XxHash.into(),
+                }),
+            ))
+        }
+        _ => None,
     }
 }
 
