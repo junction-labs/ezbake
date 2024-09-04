@@ -46,9 +46,9 @@ async fn main() {
 }
 
 fn ingest(client: kube::Client, mut writers: TypedWriters) {
-    let (svc_store, svc_watch, run_svc_watch) =
-        k8s::watch::<Service>(client.clone(), Duration::from_secs(2));
-    let (slice_store, slice_watch, run_slice_watch) =
+    let (route_watch, run_route_watch) = k8s::watch(client.clone(), Duration::from_secs(2));
+    let (svc_watch, run_svc_watch) = k8s::watch::<Service>(client.clone(), Duration::from_secs(2));
+    let (slice_watch, run_slice_watch) =
         k8s::watch::<EndpointSlice>(client, Duration::from_secs(2));
 
     // LDS ingest
@@ -57,8 +57,7 @@ fn ingest(client: kube::Client, mut writers: TypedWriters) {
             .for_type(xds::ResourceType::Listener)
             .expect("Listener writer used twice");
 
-        let listeners = ingest::Listeners::new(writer, svc_store.clone(), svc_watch.subscribe());
-
+        let listeners = ingest::Listeners::new(writer, &svc_watch, &route_watch);
         listeners.run()
     });
 
@@ -68,8 +67,7 @@ fn ingest(client: kube::Client, mut writers: TypedWriters) {
             .for_type(xds::ResourceType::Cluster)
             .expect("Cluster writer used twice");
 
-        let clusters = ingest::Clusters::new(writer, svc_store.clone(), svc_watch.subscribe());
-
+        let clusters = ingest::Clusters::new(writer, &svc_watch);
         clusters.run()
     });
 
@@ -79,14 +77,14 @@ fn ingest(client: kube::Client, mut writers: TypedWriters) {
             .for_type(xds::ResourceType::ClusterLoadAssignment)
             .expect("ClusterLoadAssignment writer used twice");
 
-        let clas =
-            ingest::LoadAssignments::new(writer, slice_store.clone(), slice_watch.subscribe());
-
+        let clas = ingest::LoadAssignments::new(writer, &slice_watch);
         clas.run()
     });
 
-    tokio::spawn(run_svc_watch);
-    tokio::spawn(run_slice_watch);
+    // FIXME: do a better error handling here
+    tokio::spawn(async { run_route_watch.await.unwrap() });
+    tokio::spawn(async { run_svc_watch.await.unwrap() });
+    tokio::spawn(async { run_slice_watch.await.unwrap() });
 }
 
 pub(crate) mod grpc_access {
