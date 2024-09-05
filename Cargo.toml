@@ -23,6 +23,4 @@ tower = "0.4"
 tower-http = { version = "0.4", features = ["metrics", "trace"] }
 once_cell = "1.19"
 prost = "0.12"
-xds-api = { git = "ssh://git@github.com/junction-labs/xds-api.git", features = [
-    "descriptor",
-] }
+xds-api = { version = "0.1", features = ["descriptor"] }
