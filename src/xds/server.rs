@@ -1,4 +1,5 @@
 use std::{
+    num::ParseIntError,
     pin::Pin,
     time::{Duration, Instant},
 };
@@ -7,13 +8,20 @@ use enum_map::EnumMap;
 use futures::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use xds_api::pb::envoy::service::discovery::v3::{
-    aggregated_discovery_service_server::AggregatedDiscoveryService, DeltaDiscoveryRequest,
-    DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
+use xds_api::pb::envoy::service::{
+    cluster::v3::cluster_discovery_service_server::ClusterDiscoveryService,
+    discovery::v3::{
+        aggregated_discovery_service_server::AggregatedDiscoveryService, DeltaDiscoveryRequest,
+        DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
+    },
+    endpoint::v3::endpoint_discovery_service_server::EndpointDiscoveryService,
+    listener::v3::listener_discovery_service_server::ListenerDiscoveryService,
+    route::v3::route_discovery_service_server::RouteDiscoveryService,
 };
 
 use crate::xds::{AdsConnection, ResourceType, Snapshot};
 
+#[derive(Clone)]
 pub(crate) struct AdsServer {
     snapshot: Snapshot,
 }
@@ -22,18 +30,57 @@ impl AdsServer {
     pub(crate) fn new(snapshot: Snapshot) -> Self {
         Self { snapshot }
     }
+
+    fn fetch(
+        &self,
+        resource_type: ResourceType,
+        request: Request<DiscoveryRequest>,
+    ) -> Result<Response<DiscoveryResponse>, Status> {
+        let request = request.into_inner();
+        dbg!(&request);
+
+        let Ok(version) = parse_nonempty(&request.version_info) else {
+            return Err(Status::invalid_argument(format!(
+                "invalid version_info: '{}'",
+                request.version_info
+            )));
+        };
+
+        let snapshot_version = self.snapshot.version(resource_type);
+        if version == Some(snapshot_version) {
+            // TODO: delay/long-poll here? this is what go-control-plane does, but it's odd
+            return Err(Status::cancelled("already up to date"));
+        }
+
+        let mut resources = Vec::with_capacity(request.resource_names.len());
+        if request.resource_names.is_empty() {
+            for e in self.snapshot.iter(resource_type) {
+                resources.push(e.value().proto.clone());
+            }
+        } else {
+            for name in &request.resource_names {
+                if let Some(e) = dbg!(self.snapshot.get(resource_type, name)) {
+                    resources.push(e.value().proto.clone())
+                }
+            }
+        };
+
+        Ok(Response::new(DiscoveryResponse {
+            version_info: snapshot_version.to_string(),
+            resources,
+            ..Default::default()
+        }))
+    }
 }
 
-type AggregatedResourcesStream =
-    Pin<Box<dyn Stream<Item = Result<DiscoveryResponse, Status>> + Send>>;
-
-type DeltaAggregatedResourcesStream =
+type SotwResponseStream = Pin<Box<dyn Stream<Item = Result<DiscoveryResponse, Status>> + Send>>;
+type DeltaResponseStream =
     Pin<Box<dyn Stream<Item = Result<DeltaDiscoveryResponse, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl AggregatedDiscoveryService for AdsServer {
-    type StreamAggregatedResourcesStream = AggregatedResourcesStream;
-    type DeltaAggregatedResourcesStream = DeltaAggregatedResourcesStream;
+    type StreamAggregatedResourcesStream = SotwResponseStream;
+    type DeltaAggregatedResourcesStream = DeltaResponseStream;
 
     async fn stream_aggregated_resources(
         &self,
@@ -120,7 +167,6 @@ async fn stream_ads(
     loop {
         let (rtype, responses) = tokio::select! {
             resource_type = timer.wait() => {
-                // TODO: skip the update if the last version is identical to this version
                 (Some(resource_type), conn.handle_snapshot_update(resource_type))
             },
             request = requests.message() => {
@@ -175,4 +221,92 @@ impl CacheTimer {
             futures::future::pending().await
         }
     }
+}
+
+macro_rules! impl_fetch_api {
+    (impl $trait:ty => $resource_type:ident { type $sotw_stream:ident; type $delta_stream:ident; fn $fetch:ident; fn $stream:ident; fn $delta:ident;}) => {
+        #[tonic::async_trait]
+        impl $trait for AdsServer {
+            type $sotw_stream = SotwResponseStream;
+            type $delta_stream = DeltaResponseStream;
+
+            async fn $fetch(
+                &self,
+                request: Request<DiscoveryRequest>,
+            ) -> Result<Response<DiscoveryResponse>, Status> {
+                self.fetch(ResourceType::$resource_type, request)
+            }
+
+            async fn $stream(
+                &self,
+                _request: Request<Streaming<DiscoveryRequest>>,
+            ) -> Result<Response<Self::$sotw_stream>, Status> {
+                return Err(Status::unimplemented(
+                    "ezbake does not support streaming EDS. please use ADS",
+                ));
+            }
+
+            async fn $delta(
+                &self,
+                _request: Request<Streaming<DeltaDiscoveryRequest>>,
+            ) -> std::result::Result<tonic::Response<Self::$delta_stream>, Status> {
+                return Err(Status::unimplemented(
+                    "ezbake does not support Incremental EDS",
+                ));
+            }
+        }
+    };
+}
+
+impl_fetch_api! {
+    impl ListenerDiscoveryService => Listener {
+        type StreamListenersStream;
+        type DeltaListenersStream;
+
+        fn fetch_listeners;
+        fn stream_listeners;
+        fn delta_listeners;
+    }
+}
+
+impl_fetch_api! {
+    impl RouteDiscoveryService => RouteConfiguration {
+        type StreamRoutesStream;
+        type DeltaRoutesStream;
+
+        fn fetch_routes;
+        fn stream_routes;
+        fn delta_routes;
+    }
+}
+
+impl_fetch_api! {
+    impl ClusterDiscoveryService => Cluster {
+        type StreamClustersStream;
+        type DeltaClustersStream;
+
+        fn fetch_clusters;
+        fn stream_clusters;
+        fn delta_clusters;
+    }
+}
+
+impl_fetch_api! {
+    impl EndpointDiscoveryService => ClusterLoadAssignment {
+
+        type StreamEndpointsStream;
+        type DeltaEndpointsStream;
+
+        fn fetch_endpoints;
+        fn stream_endpoints;
+        fn delta_endpoints;
+    }
+}
+
+fn parse_nonempty(s: &str) -> Result<Option<u64>, ParseIntError> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+
+    s.parse().map(Some)
 }

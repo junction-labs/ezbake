@@ -36,6 +36,15 @@ pub(crate) struct VersionedProto {
     pub proto: protobuf::Any,
 }
 
+impl std::fmt::Debug for VersionedProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VersionedProto")
+            .field("version", &self.version)
+            .field("proto", &"...")
+            .finish()
+    }
+}
+
 #[derive(Default)]
 struct SnapshotInner {
     typed: EnumMap<ResourceType, ResourceSnapshot>,

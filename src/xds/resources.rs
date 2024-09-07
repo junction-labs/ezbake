@@ -1,6 +1,6 @@
 use xds_api::WellKnownTypes;
 
-#[derive(Clone, Copy, Debug, enum_map::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, enum_map::Enum)]
 pub(crate) enum ResourceType {
     Listener,
     RouteConfiguration,

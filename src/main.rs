@@ -4,7 +4,13 @@ use k8s_openapi::api::{core::v1::Service, discovery::v1::EndpointSlice};
 use tonic::transport::Server;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 use xds::TypedWriters;
-use xds_api::pb::envoy::service::discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer;
+use xds_api::pb::envoy::service::{
+    cluster::v3::cluster_discovery_service_server::ClusterDiscoveryServiceServer,
+    discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer,
+    endpoint::v3::endpoint_discovery_service_server::EndpointDiscoveryServiceServer,
+    listener::v3::listener_discovery_service_server::ListenerDiscoveryServiceServer,
+    route::v3::route_discovery_service_server::RouteDiscoveryServiceServer,
+};
 
 mod ingest;
 mod k8s;
@@ -32,13 +38,20 @@ async fn main() {
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(xds_api::FILE_DESCRIPTOR_SET)
         .with_service_name("envoy.service.discovery.v3.AggregatedDiscoveryService")
-        .with_service_name("envoy.service.status.v3.ClientStatusDiscoveryService")
+        .with_service_name("envoy.service.listener.v3.ListenerDiscoveryService")
+        .with_service_name("envoy.service.route.v3.RouteDiscoveryService")
+        .with_service_name("envoy.service.cluster.v3.ClusterDiscoveryService")
+        .with_service_name("envoy.service.endpoint.v3.EndpointDiscoveryService")
         .build()
         .unwrap();
 
     Server::builder()
         .layer(grpc_access::layer!())
-        .add_service(AggregatedDiscoveryServiceServer::new(ads_server))
+        .add_service(AggregatedDiscoveryServiceServer::new(ads_server.clone()))
+        .add_service(ListenerDiscoveryServiceServer::new(ads_server.clone()))
+        .add_service(RouteDiscoveryServiceServer::new(ads_server.clone()))
+        .add_service(ClusterDiscoveryServiceServer::new(ads_server.clone()))
+        .add_service(EndpointDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(reflection)
         .serve("127.0.0.1:8008".parse().unwrap())
         .await
