@@ -22,3 +22,4 @@ tower = "0.4"
 tower-http = { version = "0.4", features = ["metrics", "trace"] }
 once_cell = "1.19"
 xds-api = { version = "0.1", features = ["descriptor"] }
+clap = { version = "4.5.17" , features = ["derive"] }

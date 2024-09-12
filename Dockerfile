@@ -1,5 +1,6 @@
 FROM --platform=linux/amd64 lukemathwalker/cargo-chef:latest-rust-latest AS amd64-chef
 FROM --platform=linux/arm64 lukemathwalker/cargo-chef:latest-rust-latest AS arm64-chef
+
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-latest AS chef
 WORKDIR /app
 
@@ -99,7 +100,7 @@ RUN set -ex; \
         *) exit 1 ;; \
     esac; \
     # Copy files from the target folder to app folder
-    cp $target/ezbake /all-files/${TARGETPLATFORM}/app
+    cp $target/ezbake     /all-files/${TARGETPLATFORM}/app
 
 # # Create a single layer image
 FROM scratch AS runtime

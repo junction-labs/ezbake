@@ -11,78 +11,70 @@ At this time ezbake is tested to support two XDS clients:
 - junction-client (https://github.com/junction-labs/junction-client)
 - gRPC (https://grpc.io/)
 
-For junction-client, ezbake will route all HTTP requests of the form `http-jct://${name}.${namespace}` 
+For junction-client, `ezbake` will route all HTTP requests of the form `http-jct://${name}.${namespace}` 
 to the service named `name` in the namespaced `namespace`.
 
-For gRPC, ezbake will route all requests for the service `xds:///${name}.${namespace}` to the 
+For gRPC, ezbake will route all requests for the endpoint `grpc://${name}.${namespace}` to the 
 service named `name` in the namespaced `namespace`.
 
 The junction-client allows richer XDS behaviour to be specified in the client code. Both
 options also support the Gateway API, documented below.
 
-## Building and Deploying to kubernetes
+For full samples, see https://github.com/junction-labs/junction-test
 
+## Building
+
+For running locally outside of Kubernetes:
+```bash
+cargo run
 ```
-docker build --tag ezbake --file ./scripts/Dockerfile .
-kubectl apply -f ./scripts/install.yml 
+
+For doing a native build docker say for running within orb:
+```bash
+docker build --tag ezbake --file ./scripts/Dockerfile-develop --load .
 ```
 
-## Using the Gateway API
-
-To configure routing rules, `ezbake` supports the HTTPRoute and GRPCRoute
-Kubernetes Gateaway API.  This is a cluster-wide CRD, which can be installed with:
-
+For a multiarch container that comes with the cost of a slower build,
+you will need to do a one off installation of buildx:
+```bash
+docker buildx create --name mybuilder2 --use
+docker buildx install
 ```
+
+Then:
+```bash
+docker build --tag ezbake --file ./scripts/Dockerfile-multiarch --load .
+```
+
+## Deploying to Kubernetes
+
+On a cluster where you have full administrative privilieges, this will 
+install `ezbake` with its own service account in the 'juction' namespace:
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
+kubectl apply -f ./scripts/install-for-cluster.yml 
+```
+
+On a cluster where you only have access to a namespace, this simpler install
+will set up  a `deployment` and `service` for `ezbake` within it. 
+
+First, if you wish to use the Gateway API CRDs, then an admin must install them with:
+
+```bash
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
 ```
 
-To set up routing information for all HTTP clients of a service, define an
-`HTTPRoute` (https://gateway-api.sigs.k8s.io/guides/http-routing/)  for a Service in the same 
-namespace the `Service` object is defined in.  For example, if we wanted to send all traffic to
-`http-jct://cool-service.cool-user/v2/` to `cooler-service` instead, we could define a rule like:
-
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: cool-route
-spec:
-  parentRefs:
-  - name: cool-service
-    kind: Service
-    group: ""
-  rules:
-  - matches:
-    - path:
-      value: "/v2/"
-    backendRefs:
-    - name: cooler-service
-      port: 8080
+Secondly, if even within the namespace your services are locked down from accessing the 
+API server, your admin must create a service account with permissions by updating `foo`
+as needed and then running
+```bash
+kubectl apply -f ./scripts/install-for-namespace-admin.yml 
 ```
 
-And then install it like:
-
-FIXME
-
-In the case of gRPC FIXME:
-
-```yaml
-apiVersion: gateway.networking.k8s.io/v1alpha2
-kind: GRPCRoute
-metadata:
-  name: bar-route
-spec:
-  parentRefs:
-  - name: cool-service
-    kind: Service
-  rules:
-  - matches:
-    - method:
-        service: com.example.User
-        method: Login
-    backendRefs:
-    - name: cooler-service
-      port: 50051
+Finally, to run ezbake in your namespace, update `foo` to your namespace and start ezbake with:
+```bash
+kubectl apply -f ./scripts/install-for-namespace.yml 
 ```
 
 ## Using the Junction Gateway API extended policies

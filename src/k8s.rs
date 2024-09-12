@@ -187,7 +187,7 @@ pub(crate) struct Watch<T: KubeResource> {
 }
 
 pub(crate) fn watch<T: KubeResource>(
-    client: kube::Client,
+    api: kube::Api<T>,
     debounce_duration: Duration,
 ) -> (
     Watch<T>,
@@ -201,18 +201,18 @@ pub(crate) fn watch<T: KubeResource>(
             store: store.clone(),
             changes: change_tx.clone(),
         },
-        run_watch(client, store, writer, change_tx, debounce_duration),
+        run_watch(api, store, writer, change_tx, debounce_duration),
     )
 }
 
 async fn run_watch<T: KubeResource>(
-    client: kube::Client,
+    api: kube::Api<T>,
     store: Store<T>,
     mut writer: Writer<T>,
     changes: broadcast::Sender<ChangedObjects<T>>,
     debounce_duration: Duration,
 ) -> Result<(), watcher::Error> {
-    let api: kube::Api<T> = kube::Api::all(client);
+    
     let stream = runtime::watcher(api, runtime::watcher::Config::default().any_semantic())
         .default_backoff()
         .modify(T::modify);

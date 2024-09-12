@@ -66,8 +66,8 @@ spec:
           image: ezbake:latest
           imagePullPolicy: IfNotPresent
           env:
-            - name: VERSION
-              value: "ezbake"
+            - name: RUST_LOG
+              value: "ezbake=trace,warn"
 ---
 apiVersion: v1
 kind: Service
@@ -75,10 +75,10 @@ metadata:
   name: ezbake
   namespace: junction
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: ezbake
   ports:
-    - nodePort: 30163
-      port: 30163
-      targetPort: 30163
+    - port: 8008
+      targetPort: 8008
+      name: grpc

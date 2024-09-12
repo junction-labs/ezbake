@@ -1,0 +1,23 @@
+FROM rust:1.81 AS build
+
+# create a new empty shell project
+RUN USER=root cargo new --bin ezbake
+WORKDIR /ezbake
+
+# copy over  manifests
+COPY ./Cargo.lock ./Cargo.lock
+COPY ./Cargo.toml ./Cargo.toml
+
+# this build step will cache  dependencies
+RUN cargo build --release
+RUN rm src/*.rs
+
+# copy source tree and build
+COPY ./src ./src
+RUN rm ./target/release/deps/ezbake*
+RUN cargo build --release
+
+# our final base
+FROM debian:bookworm-slim
+COPY --from=build /ezbake/target/release/ezbake .
+CMD ["./ezbake"]

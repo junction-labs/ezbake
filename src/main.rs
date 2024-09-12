@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use args::{Args, IngestScope};
+use clap::Parser;
 use k8s_openapi::api::{core::v1::Service, discovery::v1::EndpointSlice};
 use tonic::transport::Server;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
@@ -15,6 +17,7 @@ use xds_api::pb::envoy::service::{
 mod ingest;
 mod k8s;
 mod xds;
+mod args;
 
 // TODO: figure out multi-cluster?
 // TODO: add HTTPRoute stuff
@@ -30,8 +33,10 @@ async fn main() {
         .init();
 
     let client = kube::Client::try_default().await.unwrap();
+
+    let args = Args::parse();
     let (snapshot, writers) = xds::new_snapshot();
-    ingest(client, writers);
+    ingest(&client, &args.ingest_scope, writers);
 
     let ads_server = xds::AdsServer::new(snapshot);
 
@@ -53,16 +58,36 @@ async fn main() {
         .add_service(ClusterDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(EndpointDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(reflection)
-        .serve("127.0.0.1:8008".parse().unwrap())
+        .serve("0.0.0.0:8008".parse().unwrap())
         .await
         .unwrap()
 }
 
-fn ingest(client: kube::Client, mut writers: TypedWriters) {
-    let (route_watch, run_route_watch) = k8s::watch(client.clone(), Duration::from_secs(2));
-    let (svc_watch, run_svc_watch) = k8s::watch::<Service>(client.clone(), Duration::from_secs(2));
+
+fn get_k8s_resource_api<K>(
+    client: &kube::Client, 
+    scope: &IngestScope) 
+-> kube::Api<K>
+where
+    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    match scope {
+        IngestScope::Cluster => kube::Api::all(client.clone()),
+        IngestScope::DefaultNamespace => kube::Api::default_namespaced(client.clone()),
+        //IngestScope::NamedNamespace(s) => kube::Api::namespaced(client.clone(), &s),
+    }
+}
+
+
+fn ingest(client: &kube::Client, scope: &IngestScope, mut writers: TypedWriters) {
+
+    let (route_watch, run_route_watch) = 
+        k8s::watch(get_k8s_resource_api(client, scope), Duration::from_secs(2));
+    let (svc_watch, run_svc_watch) = 
+        k8s::watch::<Service>(get_k8s_resource_api(client, scope), Duration::from_secs(2));
     let (slice_watch, run_slice_watch) =
-        k8s::watch::<EndpointSlice>(client, Duration::from_secs(2));
+        k8s::watch::<EndpointSlice>(get_k8s_resource_api(client, scope), Duration::from_secs(2));
 
     // LDS ingest
     tokio::spawn({
@@ -95,9 +120,18 @@ fn ingest(client: kube::Client, mut writers: TypedWriters) {
     });
 
     // FIXME: do a better error handling here
-    tokio::spawn(async { run_route_watch.await.unwrap() });
-    tokio::spawn(async { run_svc_watch.await.unwrap() });
-    tokio::spawn(async { run_slice_watch.await.unwrap() });
+    // cases to handle:
+    //   intermittent faiulre of API
+    //   gateway API CRD not being installed.
+    tokio::spawn(async { 
+        run_route_watch.await.unwrap() 
+    });
+    tokio::spawn(async { 
+        run_svc_watch.await.unwrap() 
+    });
+    tokio::spawn(async { 
+        run_slice_watch.await.unwrap() 
+    });
 }
 
 pub(crate) mod grpc_access {
