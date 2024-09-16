@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4.5.17", features = ["derive"] }
 crossbeam-skiplist = "0.1"
 enum-map = "2.7"
 futures = "0.3"
@@ -12,6 +13,9 @@ h2 = "0.3"
 http = "0.2"
 k8s-openapi = { version = "0.21", features = ["v1_29"] }
 kube = { version = "0.88", features = ["runtime", "client", "derive"] }
+once_cell = "1.19"
+smol_str = "0.3"
+thiserror = "1.0"
 tokio = { version = "1.38", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.11"
@@ -20,6 +24,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower = "0.4"
 tower-http = { version = "0.4", features = ["metrics", "trace"] }
-once_cell = "1.19"
 xds-api = { version = "0.1", features = ["descriptor"] }
-clap = { version = "4.5.17" , features = ["derive"] }

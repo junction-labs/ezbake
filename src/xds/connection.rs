@@ -1,9 +1,7 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    num::ParseIntError,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use enum_map::EnumMap;
+use smol_str::{SmolStr, ToSmolStr};
 use xds_api::pb::envoy::{
     config::core::v3 as xds_node,
     service::discovery::v3::{DiscoveryRequest, DiscoveryResponse},
@@ -11,6 +9,8 @@ use xds_api::pb::envoy::{
 
 use crate::xds::cache::Snapshot;
 use crate::xds::resources::ResourceType;
+
+use super::cache::ResourceVersion;
 
 pub(crate) struct AdsConnection {
     #[allow(unused)]
@@ -20,31 +20,33 @@ pub(crate) struct AdsConnection {
     subscriptions: EnumMap<ResourceType, Option<AdsSubscription>>,
 }
 
+/// The state of a subscription to an resource type, managed as part of an
+/// [AdsConnection].
 #[derive(Debug, Default)]
 struct AdsSubscription {
     // the names that the client is subscribed to
-    resource_names: ResourceNames,
+    names: ResourceNames,
 
     // the version of the last response sent
-    last_sent_version: Option<u64>,
+    last_sent_version: Option<ResourceVersion>,
 
     // the nonce of the last reseponse sent
-    last_sent_nonce: Option<u64>,
+    last_sent_nonce: Option<SmolStr>,
 
     // the last version of each resource sent back to the client
     //
     // this isn't used to verify what resources were sent for LDS/CDS, but is
     // kept to track state for CSDS.
-    sent: BTreeMap<String, u64>,
+    sent: BTreeMap<SmolStr, SmolStr>,
 
     // whether or not the client applied the last response
     applied: bool,
 
     // the last version a client successfully ACK'd
-    last_ack_version: Option<u64>,
+    last_ack_version: Option<ResourceVersion>,
 
     // the last nonce a client successfully ACK'd
-    last_ack_nonce: Option<u64>,
+    last_ack_nonce: Option<SmolStr>,
 }
 
 impl AdsConnection {
@@ -72,24 +74,24 @@ impl AdsConnection {
         &mut self,
         request: DiscoveryRequest,
     ) -> (Option<ResourceType>, Vec<DiscoveryResponse>) {
-        // TODO: should anything else happen here?
+        // TODO: should anything else happen if there's an invalid type_url?
         let Some(rtype) = ResourceType::from_type_url(&request.type_url) else {
             return (None, Vec::new());
         };
 
         let sub = self.subscriptions[rtype].get_or_insert_with(AdsSubscription::default);
 
-        // parse the version and nonce
+        // pull the request version and nonce and immediately verify that the
+        // requests is not stale. bail out if it is.
         //
-        // TODO: something else should happen here for error handling!
-        let Ok(request_version) = parse_nonempty(&request.version_info) else {
+        // NOTE: should we actually validate that these are ostensibly resource
+        // versions/nonces we produced? they're checked for matching but that's
+        // it - is there a real benefit to telling a client it's behaving badly?
+        let Ok(request_version) = nonempty_then(&request.version_info, |s| s.parse()).transpose()
+        else {
             return (None, Vec::new());
         };
-        let Ok(request_nonce) = parse_nonempty(&request.response_nonce) else {
-            return (None, Vec::new());
-        };
-
-        // check that the request is not stale
+        let request_nonce = nonempty_then(&request.response_nonce, SmolStr::new);
         if request_nonce != sub.last_sent_nonce {
             return (None, Vec::new());
         }
@@ -101,21 +103,22 @@ impl AdsConnection {
             } else {
                 sub.applied = true;
                 sub.last_ack_nonce = request_nonce;
-                sub.last_ack_version = request_version;
+                // clone_from is here because clippy
+                sub.last_ack_version.clone_from(&request_version);
             }
         }
 
         // updates should always go out if the version requested by the client
         // isn't the current version.
-        let out_of_date = request_version != Some(self.snapshot.version(rtype));
+        let out_of_date = request_version != self.snapshot.version(rtype);
 
         // update the current subscription's resource names. if the names have
         // changed replace the current connection's names. send an update if
         // names change at all.
-        let resource_names = ResourceNames::from_names(&sub.resource_names, request.resource_names);
-        let names_changed = sub.resource_names != resource_names;
+        let resource_names = ResourceNames::from_names(&sub.names, request.resource_names);
+        let names_changed = sub.names != resource_names;
         if names_changed {
-            sub.resource_names = resource_names;
+            sub.names = resource_names;
         }
 
         let mut responses = Vec::new();
@@ -138,7 +141,7 @@ impl AdsConnection {
             return Vec::new();
         };
 
-        if sub.last_sent_version == Some(self.snapshot.version(changed_type)) {
+        if sub.last_sent_version == self.snapshot.version(changed_type) {
             return Vec::new();
         }
 
@@ -150,12 +153,15 @@ impl AdsConnection {
     }
 }
 
-fn parse_nonempty(s: &str) -> Result<Option<u64>, ParseIntError> {
+fn nonempty_then<'a, F, T>(s: &'a str, f: F) -> Option<T>
+where
+    F: FnOnce(&'a str) -> T,
+{
     if s.is_empty() {
-        return Ok(None);
+        None
+    } else {
+        Some(f(s))
     }
-
-    s.parse().map(Some)
 }
 
 impl AdsSubscription {
@@ -169,27 +175,29 @@ impl AdsSubscription {
         if snapshot.len(rtype) == 0 {
             return Vec::new();
         }
+        let Some(snapshot_version) = snapshot.version(rtype) else {
+            return Vec::new();
+        };
 
-        let snapshot_version = snapshot.version(rtype);
-
-        let iter = snapshot_iter(rtype, &self.resource_names, snapshot);
+        let iter = snapshot_iter(rtype, &self.names, snapshot);
         let (size_hint, _) = iter.size_hint();
         let mut resources = Vec::with_capacity(size_hint);
 
         for entry in iter {
             self.sent
-                .insert(entry.key().to_string(), entry.value().version);
+                .insert(entry.key().to_smolstr(), entry.value().version.to_smolstr());
             resources.push(entry.value().proto.clone());
         }
 
-        let response_nonce = next_nonce(nonce);
-        self.last_sent_nonce = Some(*nonce);
+        let nonce = next_nonce(nonce);
+        self.last_sent_nonce = Some(nonce.clone());
         self.last_sent_version = Some(snapshot_version);
 
+        let version_info = snapshot_version.to_string();
         vec![DiscoveryResponse {
             type_url: rtype.type_url().to_string(),
-            version_info: snapshot_version.to_string(),
-            nonce: response_nonce,
+            version_info,
+            nonce: nonce.to_string(),
             resources,
             ..Default::default()
         }]
@@ -204,9 +212,13 @@ impl AdsSubscription {
         // grab the snapshot version ahead of time in case there's a concurrent
         // update while we're sending. better to be a little behind than a
         // little ahead.
-        let snapshot_version = snapshot.version(rtype);
+        //
+        // If the snapshot has no data yet, don't do anything.
+        let Some(snapshot_version) = snapshot.version(rtype) else {
+            return Vec::new();
+        };
 
-        let iter = snapshot_iter(rtype, &self.resource_names, snapshot);
+        let iter = snapshot_iter(rtype, &self.names, snapshot);
         let (size_hint, _) = iter.size_hint();
 
         let mut last_nonce = 0;
@@ -214,18 +226,14 @@ impl AdsSubscription {
         for entry in iter {
             let name = entry.key();
             let resource = entry.value();
+            let resource_version = resource.version.to_smolstr();
 
-            if self
-                .sent
-                .get(name)
-                .map_or(true, |lsv| resource.version > *lsv)
-            {
-                self.sent
-                    .insert(entry.key().to_string(), entry.value().version);
+            if self.sent.get(name.as_str()) != Some(&resource_version) {
+                self.sent.insert(entry.key().to_smolstr(), resource_version);
                 responses.push(DiscoveryResponse {
                     type_url: rtype.type_url().to_string(),
                     version_info: resource.version.to_string(),
-                    nonce: next_nonce(nonce),
+                    nonce: next_nonce(nonce).to_string(),
                     resources: vec![resource.proto.clone()],
                     ..Default::default()
                 });
@@ -234,16 +242,16 @@ impl AdsSubscription {
         }
 
         self.last_sent_version = Some(snapshot_version);
-        self.last_sent_nonce = Some(last_nonce);
+        self.last_sent_nonce = Some(last_nonce.to_smolstr());
 
         responses
     }
 }
 
 #[inline]
-fn next_nonce(nonce: &mut u64) -> String {
+fn next_nonce(nonce: &mut u64) -> SmolStr {
     *nonce = nonce.wrapping_add(1);
-    nonce.to_string()
+    nonce.to_smolstr()
 }
 
 #[inline]
@@ -347,6 +355,8 @@ impl<'n, 's> Iterator for SnapshotIter<'n, 's> {
 
 #[cfg(test)]
 mod test {
+    use crate::xds::cache::ResourceVersion;
+
     use super::*;
     use xds_api::pb::envoy::config::core::v3::{self as xds_core};
     use xds_api::pb::google::protobuf;
@@ -451,7 +461,7 @@ mod test {
     }
 
     #[test]
-    fn test_handle_ack() {
+    fn test_lds_ack() {
         let node = Some(xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
@@ -688,8 +698,8 @@ mod test {
         // update and need to send a response that removes one of the resources.
         let (_, resp) = conn.handle_ads_request(discovery_ack(
             ResourceType::ClusterLoadAssignment,
-            "123",
-            &conn.nonce.to_string(),
+            &resp[1].version_info,
+            &resp[1].nonce,
             vec!["default/nginx-staging/endpoints"],
         ));
         assert_eq!(resp.len(), 0, "nothing has changed, shouldn't do anything");
@@ -701,7 +711,7 @@ mod test {
             matches!(
                 sub,
                 AdsSubscription {
-                    resource_names: ResourceNames::Explicit(_),
+                    names: ResourceNames::Explicit(_),
                     last_ack_version: Some(_),
                     last_ack_nonce: Some(_),
                     applied: true,
@@ -767,6 +777,9 @@ mod test {
             "should contain a single response",
         );
 
+        let next_version = &resp[0].version_info;
+        let next_nonce = &resp[0].nonce;
+
         // should ignore a stale incoming request
         let (_, resp) = conn.handle_ads_request(discovery_ack(
             ResourceType::ClusterLoadAssignment,
@@ -785,8 +798,8 @@ mod test {
         // only the data for new names.
         let (_, resp) = conn.handle_ads_request(discovery_ack(
             ResourceType::ClusterLoadAssignment,
-            "123",
-            &conn.nonce.to_string(),
+            next_version,
+            next_nonce,
             vec!["default/nginx-staging/endpoints", "default/nginx/endpoints"],
         ));
         assert_eq!(resp.len(), 1);
@@ -812,7 +825,7 @@ mod test {
                 .expect("resource type specified twice");
 
             writer.update(
-                version,
+                ResourceVersion::from_raw_parts(0xBEEF, version),
                 names
                     .into_iter()
                     .map(|name| (name.to_string(), Some(anything()))),
