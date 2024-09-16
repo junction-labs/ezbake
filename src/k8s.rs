@@ -212,7 +212,6 @@ async fn run_watch<T: KubeResource>(
     changes: broadcast::Sender<ChangedObjects<T>>,
     debounce_duration: Duration,
 ) -> Result<(), watcher::Error> {
-    
     let stream = runtime::watcher(api, runtime::watcher::Config::default().any_semantic())
         .default_backoff()
         .modify(T::modify);

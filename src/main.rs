@@ -14,10 +14,10 @@ use xds_api::pb::envoy::service::{
     route::v3::route_discovery_service_server::RouteDiscoveryServiceServer,
 };
 
+mod args;
 mod ingest;
 mod k8s;
 mod xds;
-mod args;
 
 // TODO: figure out multi-cluster?
 // TODO: add HTTPRoute stuff
@@ -63,11 +63,7 @@ async fn main() {
         .unwrap()
 }
 
-
-fn get_k8s_resource_api<K>(
-    client: &kube::Client, 
-    scope: &IngestScope) 
--> kube::Api<K>
+fn get_k8s_resource_api<K>(client: &kube::Client, scope: &IngestScope) -> kube::Api<K>
 where
     K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
     <K as kube::Resource>::DynamicType: Default,
@@ -79,12 +75,10 @@ where
     }
 }
 
-
 fn ingest(client: &kube::Client, scope: &IngestScope, mut writers: TypedWriters) {
-
-    let (route_watch, run_route_watch) = 
+    let (route_watch, run_route_watch) =
         k8s::watch(get_k8s_resource_api(client, scope), Duration::from_secs(2));
-    let (svc_watch, run_svc_watch) = 
+    let (svc_watch, run_svc_watch) =
         k8s::watch::<Service>(get_k8s_resource_api(client, scope), Duration::from_secs(2));
     let (slice_watch, run_slice_watch) =
         k8s::watch::<EndpointSlice>(get_k8s_resource_api(client, scope), Duration::from_secs(2));
@@ -123,15 +117,9 @@ fn ingest(client: &kube::Client, scope: &IngestScope, mut writers: TypedWriters)
     // cases to handle:
     //   intermittent faiulre of API
     //   gateway API CRD not being installed.
-    tokio::spawn(async { 
-        run_route_watch.await.unwrap() 
-    });
-    tokio::spawn(async { 
-        run_svc_watch.await.unwrap() 
-    });
-    tokio::spawn(async { 
-        run_slice_watch.await.unwrap() 
-    });
+    tokio::spawn(async { run_route_watch.await.unwrap() });
+    tokio::spawn(async { run_svc_watch.await.unwrap() });
+    tokio::spawn(async { run_slice_watch.await.unwrap() });
 }
 
 pub(crate) mod grpc_access {

@@ -1,10 +1,7 @@
 use clap::Parser;
 
-
-#[derive(
-    clap::ValueEnum, Clone, Default, Debug,
-)]
-pub enum IngestScope{
+#[derive(clap::ValueEnum, Clone, Default, Debug)]
+pub enum IngestScope {
     #[default]
     Cluster,
     DefaultNamespace,
@@ -16,4 +13,3 @@ pub struct Args {
     #[arg(short = 'i', long, default_value_t, value_enum)]
     pub ingest_scope: IngestScope,
 }
-
