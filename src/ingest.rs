@@ -1,9 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
 
 use gateway_api::apis::standard::httproutes::{
@@ -20,7 +17,7 @@ use kube::{
 };
 
 use tokio::sync::broadcast;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 use xds_api::pb::{
     envoy::{
         config::{
@@ -43,23 +40,12 @@ use crate::{
         namespace_and_name, ref_namespace_and_name, ChangedObjects, KubeResource, RefAndParents,
         Watch,
     },
-    xds::SnapshotWriter,
+    xds::{SnapshotWriter, VersionCounter},
 };
 
 // FIXME: what do we do about errors in conversion? just log? the current situation is truly terrible
 // FIXME: Listeners, Clusters, and Endpoints should all be async fn (...) -> Result<(), Error> instead of objects that get immediately new()'d then run()'d.
 // FIXME: tests????
-
-#[derive(Debug, Default)]
-struct VersionCounter {
-    counter: AtomicU64,
-}
-
-impl VersionCounter {
-    fn next(&self) -> u64 {
-        self.counter.fetch_add(1, Ordering::SeqCst)
-    }
-}
 
 /// `Listeners`` listens for changes to either `HTTPRoute`s or `Service`s in
 /// kube and converts them into XDS Listener resources. All Listeners and
@@ -86,7 +72,7 @@ impl Listeners {
         routes: &Watch<HTTPRoute>,
     ) -> Self {
         Listeners {
-            version_counter: VersionCounter::default(),
+            version_counter: VersionCounter::with_process_prefix(),
             writer,
             services: services.store.clone(),
             service_changed: services.changes.subscribe(),
@@ -104,14 +90,14 @@ impl Listeners {
                     let updates = objs.iter().map(|obj_ref| self.service_changed(&obj_ref.obj));
                     let version = self.version_counter.next();
                     self.writer.update(version, updates);
-                    trace!(version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
+                    debug!(%version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
                 },
                 routes = self.routes_changed.recv() => {
                     if let Ok(objs) = routes {
                         let updates = objs.iter().flat_map(|obj_ref| self.route_changed(obj_ref));
                         let version = self.version_counter.next();
                         self.writer.update(version, updates);
-                        trace!(version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
+                        debug!(%version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
                     }
                 },
             }
@@ -187,7 +173,7 @@ pub(crate) struct Clusters {
 impl Clusters {
     pub(crate) fn new(writer: SnapshotWriter, services: &Watch<Service>) -> Self {
         Self {
-            version_counter: VersionCounter::default(),
+            version_counter: VersionCounter::with_process_prefix(),
             writer,
             services: services.store.clone(),
             service_changed: services.changes.subscribe(),
@@ -207,7 +193,7 @@ impl Clusters {
                 .map(|svc_ref| self.service_changed(&svc_ref.obj));
             let version = self.version_counter.next();
             self.writer.update(version, updates);
-            trace!(version, changed = services.len(), resource_type = ?crate::xds::ResourceType::Cluster, "updated snapshot");
+            debug!(%version, changed = services.len(), resource_type = ?crate::xds::ResourceType::Cluster, "updated snapshot");
         }
     }
 
@@ -243,7 +229,7 @@ pub(crate) struct LoadAssignments {
 impl LoadAssignments {
     pub(crate) fn new(writer: SnapshotWriter, slices: &Watch<EndpointSlice>) -> Self {
         Self {
-            version_counter: VersionCounter::default(),
+            version_counter: VersionCounter::with_process_prefix(),
             writer,
             slices: slices.store.clone(),
             slices_changed: slices.changes.subscribe(),
@@ -294,8 +280,8 @@ impl LoadAssignments {
             let changed = updates.len();
             self.writer.update(version, updates.into_iter());
 
-            trace!(
-                version,
+            debug!(
+                %version,
                 changed,
                 resource_type = ?crate::xds::ResourceType::ClusterLoadAssignment,
                 "updated snapshot",

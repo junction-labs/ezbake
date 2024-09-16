@@ -1,5 +1,4 @@
 use std::{
-    num::ParseIntError,
     pin::Pin,
     time::{Duration, Instant},
 };
@@ -37,17 +36,13 @@ impl AdsServer {
         request: Request<DiscoveryRequest>,
     ) -> Result<Response<DiscoveryResponse>, Status> {
         let request = request.into_inner();
-        dbg!(&request);
 
-        let Ok(version) = parse_nonempty(&request.version_info) else {
-            return Err(Status::invalid_argument(format!(
-                "invalid version_info: '{}'",
-                request.version_info
-            )));
+        let Some(snapshot_version) = self.snapshot.version(resource_type) else {
+            return Err(Status::unavailable("no snapshot available"));
         };
 
-        let snapshot_version = self.snapshot.version(resource_type);
-        if version == Some(snapshot_version) {
+        let request_version = request.version_info.parse().ok();
+        if request_version == Some(snapshot_version) {
             // TODO: delay/long-poll here? this is what go-control-plane does, but it's odd
             return Err(Status::cancelled("already up to date"));
         }
@@ -59,7 +54,7 @@ impl AdsServer {
             }
         } else {
             for name in &request.resource_names {
-                if let Some(e) = dbg!(self.snapshot.get(resource_type, name)) {
+                if let Some(e) = self.snapshot.get(resource_type, name) {
                     resources.push(e.value().proto.clone())
                 }
             }
@@ -301,12 +296,4 @@ impl_fetch_api! {
         fn stream_endpoints;
         fn delta_endpoints;
     }
-}
-
-fn parse_nonempty(s: &str) -> Result<Option<u64>, ParseIntError> {
-    if s.is_empty() {
-        return Ok(None);
-    }
-
-    s.parse().map(Some)
 }
