@@ -34,10 +34,11 @@ struct CliArgs {
 }
 
 #[derive(Args, Debug)]
+#[group(multiple = false)]
 struct NamespaceArgs {
     /// Watch all namespaces. Defaults to false.
     ///
-    /// If set, --namespace will be ignored.
+    /// It's an error to set both --all-namespaces and --namespace.
     #[arg(long)]
     all_namespaces: bool,
 
@@ -46,7 +47,7 @@ struct NamespaceArgs {
     /// the namespace specified by the service account the server is running as,
     /// or the `default` namespace.
     ///
-    /// This option is ignored if --all-namespaces is set.
+    /// It's an error to set both --all-namespaces and --namespace.
     #[arg(long)]
     namespace: Option<String>,
 }
