@@ -245,7 +245,15 @@ async fn run_watch<T: KubeResource>(
         }
     }
 
+    debug!(kind = T::static_kind(), "watch exiting");
     Ok(())
+}
+
+pub(crate) fn is_api_not_found(e: &watcher::Error) -> bool {
+    matches!(
+        e,
+        watcher::Error::InitialListFailed(kube::Error::Api(e)) if e.code == 404,
+    )
 }
 
 fn handle_watch_event<T: KubeResource>(

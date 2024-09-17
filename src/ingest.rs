@@ -85,7 +85,10 @@ impl Listeners {
         loop {
             tokio::select! {
                 services = self.service_changed.recv() => {
-                    let objs = services.expect("Listener construction fell behind. Giving up and going away.");
+                    let Ok(objs) = services else {
+                        debug!(resource_type = ?crate::xds::ResourceType::Listener, "ingest exiting");
+                        break;
+                    };
 
                     let updates = objs.iter().map(|obj_ref| self.service_changed(&obj_ref.obj));
                     let version = self.version_counter.next();
@@ -93,12 +96,15 @@ impl Listeners {
                     debug!(%version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
                 },
                 routes = self.routes_changed.recv() => {
-                    if let Ok(objs) = routes {
-                        let updates = objs.iter().flat_map(|obj_ref| self.route_changed(obj_ref));
-                        let version = self.version_counter.next();
-                        self.writer.update(version, updates);
-                        debug!(%version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
-                    }
+                    let Ok(objs) = routes else {
+                        debug!(resource_type = ?crate::xds::ResourceType::Listener, "ingest exiting");
+                        break;
+                    };
+
+                    let updates = objs.iter().flat_map(|obj_ref| self.route_changed(obj_ref));
+                    let version = self.version_counter.next();
+                    self.writer.update(version, updates);
+                    debug!(%version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
                 },
             }
         }
@@ -182,11 +188,10 @@ impl Clusters {
 
     pub(crate) async fn run(mut self) {
         loop {
-            let services = self
-                .service_changed
-                .recv()
-                .await
-                .expect("Cluster construction fell behind. Giving up and going away.");
+            let Ok(services) = self.service_changed.recv().await else {
+                debug!(resource_type = ?crate::xds::ResourceType::Cluster, "ingest exiting");
+                break;
+            };
 
             let updates = services
                 .iter()
@@ -238,11 +243,10 @@ impl LoadAssignments {
 
     pub(crate) async fn run(mut self) {
         loop {
-            let slice_refs = self
-                .slices_changed
-                .recv()
-                .await
-                .expect("Cluster construction fell behind. Giving up and going away.");
+            let Ok(slice_refs) = self.slices_changed.recv().await else {
+                debug!(resource_type = ?crate::xds::ResourceType::ClusterLoadAssignment, "ingest exiting");
+                break;
+            };
 
             let mut changed_svcs = HashSet::new();
             for slice_ref in slice_refs.iter() {
