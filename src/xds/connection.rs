@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use enum_map::EnumMap;
 use smol_str::{SmolStr, ToSmolStr};
@@ -11,6 +14,21 @@ use crate::xds::cache::Snapshot;
 use crate::xds::resources::ResourceType;
 
 use super::cache::ResourceVersion;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConnectionError {
+    #[error("missing node info")]
+    MisingNode,
+
+    #[error("invalid request: {0}")]
+    InvalidRequest(anyhow::Error),
+}
+
+impl ConnectionError {
+    pub(crate) fn into_status(self) -> tonic::Status {
+        tonic::Status::invalid_argument(self.to_string())
+    }
+}
 
 pub(crate) struct AdsConnection {
     #[allow(unused)]
@@ -53,10 +71,10 @@ impl AdsConnection {
     pub(crate) fn from_initial_request(
         mut request: DiscoveryRequest,
         snapshot: Snapshot,
-    ) -> Result<(Self, Option<ResourceType>, Vec<DiscoveryResponse>), &'static str> {
+    ) -> Result<(Self, Option<ResourceType>, Vec<DiscoveryResponse>), ConnectionError> {
         let node = match request.node.take() {
             Some(node) => node,
-            None => return Err("missing node info"),
+            None => return Err(ConnectionError::MisingNode),
         };
 
         let mut connection = Self {
@@ -66,17 +84,26 @@ impl AdsConnection {
             subscriptions: EnumMap::default(),
         };
 
-        let (rtype, responses) = connection.handle_ads_request(request);
+        let (rtype, responses) = connection.handle_ads_request(request)?;
         Ok((connection, rtype, responses))
+    }
+
+    pub(crate) fn node(&self) -> &xds_node::Node {
+        &self.node
     }
 
     pub(crate) fn handle_ads_request(
         &mut self,
         request: DiscoveryRequest,
-    ) -> (Option<ResourceType>, Vec<DiscoveryResponse>) {
-        // TODO: should anything else happen if there's an invalid type_url?
+    ) -> Result<(Option<ResourceType>, Vec<DiscoveryResponse>), ConnectionError> {
+        macro_rules! empty_response {
+            () => {
+                Ok((None, Vec::new()))
+            };
+        }
+
         let Some(rtype) = ResourceType::from_type_url(&request.type_url) else {
-            return (None, Vec::new());
+            return Ok((None, Vec::new()));
         };
 
         let sub = self.subscriptions[rtype].get_or_insert_with(AdsSubscription::default);
@@ -87,13 +114,12 @@ impl AdsConnection {
         // NOTE: should we actually validate that these are ostensibly resource
         // versions/nonces we produced? they're checked for matching but that's
         // it - is there a real benefit to telling a client it's behaving badly?
-        let Ok(request_version) = nonempty_then(&request.version_info, |s| s.parse()).transpose()
-        else {
-            return (None, Vec::new());
-        };
+        let request_version = nonempty_then(&request.version_info, ResourceVersion::from_str)
+            .transpose()
+            .map_err(|e| ConnectionError::InvalidRequest(e.into()))?;
         let request_nonce = nonempty_then(&request.response_nonce, SmolStr::new);
         if request_nonce != sub.last_sent_nonce {
-            return (None, Vec::new());
+            return empty_response!();
         }
 
         // if this isn't the initial request on a stream, update some state
@@ -130,7 +156,7 @@ impl AdsConnection {
             }
         }
 
-        (Some(rtype), responses)
+        Ok((Some(rtype), responses))
     }
 
     pub(crate) fn handle_snapshot_update(
@@ -491,12 +517,14 @@ mod test {
         assert_eq!(resp[0].resources.len(), 1);
 
         // handle an ACK
-        let (_, resp) = conn.handle_ads_request(discovery_ack(
-            ResourceType::Listener,
-            &resp[0].version_info,
-            &resp[0].nonce,
-            vec![],
-        ));
+        let (_, resp) = conn
+            .handle_ads_request(discovery_ack(
+                ResourceType::Listener,
+                &resp[0].version_info,
+                &resp[0].nonce,
+                vec![],
+            ))
+            .unwrap();
         assert!(resp.is_empty());
 
         let sub = conn.subscriptions[ResourceType::Listener].as_ref().unwrap();
@@ -545,13 +573,15 @@ mod test {
         assert_eq!(resp[0].resources.len(), 1);
 
         // handle an ACK
-        let (_, resp) = conn.handle_ads_request(discovery_nack(
-            ResourceType::Listener,
-            &resp[0].version_info,
-            &resp[0].nonce,
-            vec![],
-            "you can't cut back on funding, you will regret this",
-        ));
+        let (_, resp) = conn
+            .handle_ads_request(discovery_nack(
+                ResourceType::Listener,
+                &resp[0].version_info,
+                &resp[0].nonce,
+                vec![],
+                "you can't cut back on funding, you will regret this",
+            ))
+            .unwrap();
         assert!(resp.is_empty());
 
         let sub = conn.subscriptions[ResourceType::Listener].as_ref().unwrap();
@@ -608,12 +638,14 @@ mod test {
         //
         // this should generate a new response, because Clusters are SoTW for
         // update and need to send a response that removes one of the resources.
-        let (_, resp) = conn.handle_ads_request(discovery_ack(
-            ResourceType::Cluster,
-            &resp[0].version_info,
-            &resp[0].nonce,
-            vec!["default/nginx-staging/cluster"],
-        ));
+        let (_, resp) = conn
+            .handle_ads_request(discovery_ack(
+                ResourceType::Cluster,
+                &resp[0].version_info,
+                &resp[0].nonce,
+                vec!["default/nginx-staging/cluster"],
+            ))
+            .unwrap();
         assert_eq!(resp.len(), 1, "should send back a SotW response");
         assert_eq!(resp[0].type_url, ResourceType::Cluster.type_url());
         assert_eq!(
@@ -638,12 +670,14 @@ mod test {
 
         // second ACK shouldn't generate anything else, there's nothing to do
         // because the subscription hasn't changed.
-        let (_, resp) = conn.handle_ads_request(discovery_ack(
-            ResourceType::Cluster,
-            &resp[0].version_info,
-            &resp[0].nonce,
-            vec!["default/nginx-staging/cluster"],
-        ));
+        let (_, resp) = conn
+            .handle_ads_request(discovery_ack(
+                ResourceType::Cluster,
+                &resp[0].version_info,
+                &resp[0].nonce,
+                vec!["default/nginx-staging/cluster"],
+            ))
+            .unwrap();
         assert!(resp.is_empty());
     }
 
@@ -691,17 +725,19 @@ mod test {
             resp.iter().all(|msg| msg.resources.len() == 1),
             "should contain a single response",
         );
+        let last_version = &resp[0].version_info;
+        let last_nonce = &resp[0].nonce;
 
-        // first ACK changes the subscriptions
-        //
-        // this should generate a new response, because Clusters are SoTW for
-        // update and need to send a response that removes one of the resources.
-        let (_, resp) = conn.handle_ads_request(discovery_ack(
-            ResourceType::ClusterLoadAssignment,
-            &resp[1].version_info,
-            &resp[1].nonce,
-            vec!["default/nginx-staging/endpoints"],
-        ));
+        // first ACK changes the subscriptions. shouldn't generate a response because
+        // EDS doesn't require full sotw updates.
+        let (_, resp) = conn
+            .handle_ads_request(discovery_ack(
+                ResourceType::ClusterLoadAssignment,
+                &resp[1].version_info,
+                &resp[1].nonce,
+                vec!["default/nginx-staging/endpoints"],
+            ))
+            .unwrap();
         assert_eq!(resp.len(), 0, "nothing has changed, shouldn't do anything");
 
         let sub = conn.subscriptions[ResourceType::ClusterLoadAssignment]
@@ -723,12 +759,14 @@ mod test {
 
         // second ACK shouldn't generate anything else, there's nothing to do
         // because the subscription hasn't changed.
-        let (_, resp) = conn.handle_ads_request(discovery_ack(
-            ResourceType::ClusterLoadAssignment,
-            "123",
-            &conn.nonce.to_string(),
-            vec!["default/nginx-staging/endpoints"],
-        ));
+        let (_, resp) = conn
+            .handle_ads_request(discovery_ack(
+                ResourceType::ClusterLoadAssignment,
+                last_version,
+                last_nonce,
+                vec!["default/nginx-staging/endpoints"],
+            ))
+            .unwrap();
         assert!(resp.is_empty());
     }
 
@@ -781,27 +819,31 @@ mod test {
         let next_nonce = &resp[0].nonce;
 
         // should ignore a stale incoming request
-        let (_, resp) = conn.handle_ads_request(discovery_ack(
-            ResourceType::ClusterLoadAssignment,
-            "",
-            "",
-            vec![
-                "default/nginx-staging/endpoints",
-                "default/nginx/endpoints",
-                "stale/stale/stale",
-                "stale/staler/stalest",
-            ],
-        ));
+        let (_, resp) = conn
+            .handle_ads_request(discovery_ack(
+                ResourceType::ClusterLoadAssignment,
+                "",
+                "",
+                vec![
+                    "default/nginx-staging/endpoints",
+                    "default/nginx/endpoints",
+                    "stale/stale/stale",
+                    "stale/staler/stalest",
+                ],
+            ))
+            .unwrap();
         assert!(resp.is_empty());
 
         // should handle the next request. incremental means returning
         // only the data for new names.
-        let (_, resp) = conn.handle_ads_request(discovery_ack(
-            ResourceType::ClusterLoadAssignment,
-            next_version,
-            next_nonce,
-            vec!["default/nginx-staging/endpoints", "default/nginx/endpoints"],
-        ));
+        let (_, resp) = conn
+            .handle_ads_request(discovery_ack(
+                ResourceType::ClusterLoadAssignment,
+                next_version,
+                next_nonce,
+                vec!["default/nginx-staging/endpoints", "default/nginx/endpoints"],
+            ))
+            .unwrap();
         assert_eq!(resp.len(), 1);
         assert!(
             resp.iter()

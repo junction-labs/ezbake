@@ -1,7 +1,6 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
-use args::{Args, IngestScope};
-use clap::Parser;
+use clap::{Args, Parser};
 use k8s_openapi::api::{core::v1::Service, discovery::v1::EndpointSlice};
 use tonic::transport::Server;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
@@ -14,32 +13,82 @@ use xds_api::pb::envoy::service::{
     route::v3::route_discovery_service_server::RouteDiscoveryServiceServer,
 };
 
-mod args;
 mod ingest;
 mod k8s;
 mod xds;
 
-// TODO: figure out multi-cluster?
-// TODO: add HTTPRoute stuff
+// TODO: multi-cluster
 // TODO: actually figure out metrics/logs/etc. would be nice to have a flag that
 //       dumps XDS requests in a chrome trace format or something.
 
+/// an ez service discovery server
+#[derive(Parser, Debug)]
+#[command(version)]
+struct CliArgs {
+    /// The local address to listen on.
+    #[arg(long, short, default_value = "127.0.0.1:8008")]
+    listen_addr: String,
+
+    #[command(flatten)]
+    namespace_args: NamespaceArgs,
+}
+
+#[derive(Args, Debug)]
+#[group(multiple = false)]
+struct NamespaceArgs {
+    /// Watch all namespaces. Defaults to false.
+    ///
+    /// It's an error to set both --all-namespaces and --namespace.
+    #[arg(long)]
+    all_namespaces: bool,
+
+    /// The namespace to watch. If this option is not set explicitly, ezbake
+    /// will watch the the namespace set in the kubeconfig's s current context,
+    /// the namespace specified by the service account the server is running as,
+    /// or the `default` namespace.
+    ///
+    /// It's an error to set both --all-namespaces and --namespace.
+    #[arg(long)]
+    namespace: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
+    let default_log_filter = "ezbake=info"
+        .parse()
+        .expect("default log filter must be valid");
+
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(default_log_filter)
+                .from_env_lossy(),
+        )
         .with_span_events(FmtSpan::CLOSE)
         .with_target(true)
         .init();
 
     let client = kube::Client::try_default().await.unwrap();
 
-    let args = Args::parse();
+    let args = CliArgs::parse();
     let (snapshot, writers) = xds::new_snapshot();
-    ingest(&client, &args.ingest_scope, writers);
 
+    let ingest = ingest(
+        &client,
+        args.namespace_args.all_namespaces,
+        args.namespace_args.namespace.as_deref(),
+        writers,
+    );
+    let serve = serve(&args.listen_addr, snapshot);
+
+    if let Err(e) = tokio::try_join!(ingest, serve) {
+        tracing::error!(err = ?e, "exiting: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn serve(addr: &str, snapshot: xds::Snapshot) -> anyhow::Result<()> {
     let ads_server = xds::AdsServer::new(snapshot);
-
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(xds_api::FILE_DESCRIPTOR_SET)
         .with_service_name("envoy.service.discovery.v3.AggregatedDiscoveryService")
@@ -47,10 +96,9 @@ async fn main() {
         .with_service_name("envoy.service.route.v3.RouteDiscoveryService")
         .with_service_name("envoy.service.cluster.v3.ClusterDiscoveryService")
         .with_service_name("envoy.service.endpoint.v3.EndpointDiscoveryService")
-        .build()
-        .unwrap();
+        .build()?;
 
-    Server::builder()
+    let server = Server::builder()
         .layer(grpc_access::layer!())
         .add_service(AggregatedDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(ListenerDiscoveryServiceServer::new(ads_server.clone()))
@@ -58,30 +106,46 @@ async fn main() {
         .add_service(ClusterDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(EndpointDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(reflection)
-        .serve("0.0.0.0:8008".parse().unwrap())
-        .await
-        .unwrap()
+        .serve(addr.parse()?);
+
+    server.await?;
+    Ok(())
 }
 
-fn get_k8s_resource_api<K>(client: &kube::Client, scope: &IngestScope) -> kube::Api<K>
-where
-    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
-    <K as kube::Resource>::DynamicType: Default,
-{
-    match scope {
-        IngestScope::Cluster => kube::Api::all(client.clone()),
-        IngestScope::DefaultNamespace => kube::Api::default_namespaced(client.clone()),
-        //IngestScope::NamedNamespace(s) => kube::Api::namespaced(client.clone(), &s),
-    }
-}
+async fn ingest(
+    client: &kube::Client,
+    all_namespaces: bool,
+    namespace: Option<&str>,
+    mut writers: TypedWriters,
+) -> anyhow::Result<()> {
+    // watch Gateway API routes
+    //
+    // the watches here need a little bit of extra error handling, in case the APIs
+    // are not installed, installed at an incompatible version, or someone removes
+    // a CRD at a weird time.
+    let (route_watch, run_route_watch) = k8s::watch(
+        kube_api(client, all_namespaces, namespace),
+        Duration::from_secs(2),
+    );
+    let run_route_watch = async {
+        match run_route_watch.await {
+            Err(e) if k8s::is_api_not_found(&e) => {
+                tracing::info!("HTTPRoute API not found. Continuing without Gateway APIs");
+                Ok(())
+            }
+            v => v,
+        }
+    };
 
-fn ingest(client: &kube::Client, scope: &IngestScope, mut writers: TypedWriters) {
-    let (route_watch, run_route_watch) =
-        k8s::watch(get_k8s_resource_api(client, scope), Duration::from_secs(2));
-    let (svc_watch, run_svc_watch) =
-        k8s::watch::<Service>(get_k8s_resource_api(client, scope), Duration::from_secs(2));
-    let (slice_watch, run_slice_watch) =
-        k8s::watch::<EndpointSlice>(get_k8s_resource_api(client, scope), Duration::from_secs(2));
+    // watch Services and EndpointSlices
+    let (svc_watch, run_svc_watch) = k8s::watch::<Service>(
+        kube_api(client, all_namespaces, namespace),
+        Duration::from_secs(2),
+    );
+    let (slice_watch, run_slice_watch) = k8s::watch::<EndpointSlice>(
+        kube_api(client, all_namespaces, namespace),
+        Duration::from_secs(2),
+    );
 
     // LDS ingest
     tokio::spawn({
@@ -113,13 +177,39 @@ fn ingest(client: &kube::Client, scope: &IngestScope, mut writers: TypedWriters)
         clas.run()
     });
 
-    // FIXME: do a better error handling here
-    // cases to handle:
-    //   intermittent faiulre of API
-    //   gateway API CRD not being installed.
-    tokio::spawn(async { run_route_watch.await.unwrap() });
-    tokio::spawn(async { run_svc_watch.await.unwrap() });
-    tokio::spawn(async { run_slice_watch.await.unwrap() });
+    tokio::try_join!(
+        spawn_watch(run_route_watch),
+        spawn_watch(run_slice_watch),
+        spawn_watch(run_svc_watch),
+    )?;
+
+    Ok(())
+}
+
+fn kube_api<K>(client: &kube::Client, all_namespaces: bool, namespace: Option<&str>) -> kube::Api<K>
+where
+    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    match (all_namespaces, namespace) {
+        (true, _) => kube::Api::all(client.clone()),
+        (_, Some(namespace)) => kube::Api::namespaced(client.clone(), &namespace),
+        _ => kube::Api::default_namespaced(client.clone()),
+    }
+}
+
+async fn spawn_watch<F, E>(watch: F) -> anyhow::Result<()>
+where
+    F: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let handle = tokio::spawn(watch);
+
+    match handle.await {
+        Ok(Ok(val)) => Ok(val),
+        Ok(Err(e)) => Err(e.into()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub(crate) mod grpc_access {
