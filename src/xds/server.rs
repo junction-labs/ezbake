@@ -226,6 +226,12 @@ fn io_source(status: &Status) -> Option<&std::io::Error> {
     }
 }
 
+/// A debouncing timer, for sending cache updates. The timer fires `interval`
+/// after the first time it's touched, and ignores all touches until after
+/// it fires again.
+///
+/// The timer is keyed by [ResourceType]. It could be generic, but there's no
+/// reason to do that.
 struct CacheTimer {
     interval: Duration,
     timers: EnumMap<ResourceType, Option<Instant>>,
@@ -240,22 +246,103 @@ impl CacheTimer {
     }
 
     fn touch(&mut self, resource_type: ResourceType, now: Instant) {
-        self.timers[resource_type] = Some(now + self.interval)
+        self.timers[resource_type].get_or_insert(now + self.interval);
     }
 
-    async fn wait(&mut self) -> ResourceType {
+    fn next_deadline(&mut self) -> Option<(ResourceType, Instant)> {
         let min_entry = self
             .timers
             .iter()
             .filter_map(|(rtype, deadline)| Option::zip(Some(rtype), *deadline))
             .min_by_key(|(_rtype, deadline)| *deadline);
 
-        if let Some((rtype, deadline)) = min_entry {
-            tokio::time::sleep_until(deadline.into()).await;
-            rtype
-        } else {
-            futures::future::pending().await
+        if let Some((rtype, _)) = min_entry.as_ref() {
+            self.timers[*rtype] = None;
         }
+
+        min_entry
+    }
+
+    async fn wait(&mut self) -> ResourceType {
+        match self.next_deadline() {
+            Some((rtype, d)) => {
+                tokio::time::sleep_until(d.into()).await;
+                rtype
+            }
+            None => futures::future::pending().await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_timer {
+    use std::time::{Duration, Instant};
+
+    use crate::xds::ResourceType;
+
+    use super::CacheTimer;
+
+    #[test]
+    fn test_touch_one() {
+        let now = Instant::now();
+        let mut t = CacheTimer::new(Duration::from_secs(1));
+
+        // touching once sets the deadline.
+        t.touch(ResourceType::Cluster, now);
+        assert_eq!(
+            t.next_deadline(),
+            Some((ResourceType::Cluster, now + t.interval))
+        );
+        assert_eq!(t.next_deadline(), None);
+
+        // touching twice has no effect
+        t.touch(ResourceType::Cluster, now);
+        t.touch(ResourceType::Cluster, now);
+        assert_eq!(
+            t.next_deadline(),
+            Some((ResourceType::Cluster, now + t.interval))
+        );
+        assert_eq!(t.next_deadline(), None);
+    }
+
+    #[test]
+    fn test_touch_many() {
+        let now = Instant::now();
+        let delta = Duration::from_millis(250);
+        let mut t = CacheTimer::new(Duration::from_secs(1));
+
+        // touch two in sequence
+        t.touch(ResourceType::Cluster, now);
+        t.touch(ResourceType::ClusterLoadAssignment, now + delta);
+        assert_eq!(
+            t.next_deadline(),
+            Some((ResourceType::Cluster, now + t.interval))
+        );
+        assert_eq!(
+            t.next_deadline(),
+            Some((
+                ResourceType::ClusterLoadAssignment,
+                now + delta + t.interval
+            ))
+        );
+        assert_eq!(t.next_deadline(), None);
+
+        // touch two, multiple touches don't reset things
+        t.touch(ResourceType::Cluster, now);
+        t.touch(ResourceType::Cluster, now + delta);
+        t.touch(ResourceType::ClusterLoadAssignment, now + delta);
+        assert_eq!(
+            t.next_deadline(),
+            Some((ResourceType::Cluster, now + t.interval))
+        );
+        assert_eq!(
+            t.next_deadline(),
+            Some((
+                ResourceType::ClusterLoadAssignment,
+                now + delta + t.interval
+            ))
+        );
+        assert_eq!(t.next_deadline(), None);
     }
 }
 
