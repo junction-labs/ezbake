@@ -1,4 +1,5 @@
 use std::{
+    net::SocketAddr,
     pin::Pin,
     time::{Duration, Instant},
 };
@@ -17,18 +18,29 @@ use xds_api::pb::envoy::service::{
     endpoint::v3::endpoint_discovery_service_server::EndpointDiscoveryService,
     listener::v3::listener_discovery_service_server::ListenerDiscoveryService,
     route::v3::route_discovery_service_server::RouteDiscoveryService,
+    status::v3::{
+        client_config::GenericXdsConfig,
+        client_status_discovery_service_server::ClientStatusDiscoveryService, ClientConfig,
+        ClientStatusRequest, ClientStatusResponse, ConfigStatus,
+    },
 };
 
 use crate::xds::{AdsConnection, ResourceType, Snapshot};
 
+use super::connection::ConnectionSnapshot;
+
 #[derive(Clone)]
 pub(crate) struct AdsServer {
     snapshot: Snapshot,
+    clients: ConnectionSnapshot,
 }
 
 impl AdsServer {
     pub(crate) fn new(snapshot: Snapshot) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            clients: Default::default(),
+        }
     }
 
     fn fetch(
@@ -69,36 +81,6 @@ impl AdsServer {
     }
 }
 
-type SotwResponseStream = Pin<Box<dyn Stream<Item = Result<DiscoveryResponse, Status>> + Send>>;
-type DeltaResponseStream =
-    Pin<Box<dyn Stream<Item = Result<DeltaDiscoveryResponse, Status>> + Send>>;
-
-#[tonic::async_trait]
-impl AggregatedDiscoveryService for AdsServer {
-    type StreamAggregatedResourcesStream = SotwResponseStream;
-    type DeltaAggregatedResourcesStream = DeltaResponseStream;
-
-    async fn stream_aggregated_resources(
-        &self,
-        request: Request<Streaming<DiscoveryRequest>>,
-    ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
-        let requests = request.into_inner();
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-
-        tokio::spawn(stream_ads(requests, tx, self.snapshot.clone()));
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-
-    async fn delta_aggregated_resources(
-        &self,
-        _request: Request<Streaming<DeltaDiscoveryRequest>>,
-    ) -> std::result::Result<tonic::Response<Self::DeltaAggregatedResourcesStream>, Status> {
-        return Err(Status::unimplemented(
-            "ezbake does not support Incremental ADS",
-        ));
-    }
-}
-
 macro_rules! try_send {
     ($ch:expr, $value:expr) => {
         if let Err(_) = $ch.send($value).await {
@@ -134,9 +116,11 @@ macro_rules! debug_xds_discovery_response {
 }
 
 async fn stream_ads(
+    snapshot: Snapshot,
+    clients: ConnectionSnapshot,
+    remote_addr: Option<SocketAddr>,
     mut requests: Streaming<DiscoveryRequest>,
     send_response: tokio::sync::mpsc::Sender<Result<DiscoveryResponse, Status>>,
-    snapshot: Snapshot,
 ) {
     macro_rules! handle_message {
         ($message:expr) => {
@@ -179,6 +163,7 @@ async fn stream_ads(
         debug_xds_discovery_response!(&conn.node, &response);
         try_send!(send_response, Ok(response));
     }
+    clients.update(&conn, remote_addr);
 
     loop {
         let (rtype, responses) = tokio::select! {
@@ -207,6 +192,7 @@ async fn stream_ads(
             debug_xds_discovery_response!(&conn.node, &response);
             try_send!(send_response, Ok(response));
         }
+        clients.update(&conn, remote_addr);
     }
 }
 
@@ -346,6 +332,44 @@ mod test_timer {
     }
 }
 
+type SotwResponseStream = Pin<Box<dyn Stream<Item = Result<DiscoveryResponse, Status>> + Send>>;
+type DeltaResponseStream =
+    Pin<Box<dyn Stream<Item = Result<DeltaDiscoveryResponse, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl AggregatedDiscoveryService for AdsServer {
+    type StreamAggregatedResourcesStream = SotwResponseStream;
+    type DeltaAggregatedResourcesStream = DeltaResponseStream;
+
+    async fn stream_aggregated_resources(
+        &self,
+        request: Request<Streaming<DiscoveryRequest>>,
+    ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
+        let remote_addr = request.remote_addr();
+
+        let requests = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+        tokio::spawn(stream_ads(
+            self.snapshot.clone(),
+            self.clients.clone(),
+            remote_addr,
+            requests,
+            tx,
+        ));
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn delta_aggregated_resources(
+        &self,
+        _request: Request<Streaming<DeltaDiscoveryRequest>>,
+    ) -> std::result::Result<tonic::Response<Self::DeltaAggregatedResourcesStream>, Status> {
+        return Err(Status::unimplemented(
+            "ezbake does not support Incremental ADS",
+        ));
+    }
+}
+
 macro_rules! impl_fetch_api {
     (impl $trait:ty => $resource_type:ident { type $sotw_stream:ident; type $delta_stream:ident; fn $fetch:ident; fn $stream:ident; fn $delta:ident;}) => {
         #[tonic::async_trait]
@@ -423,5 +447,65 @@ impl_fetch_api! {
         fn fetch_endpoints;
         fn stream_endpoints;
         fn delta_endpoints;
+    }
+}
+
+type ClientStatusResponsestream =
+    Pin<Box<dyn Stream<Item = Result<ClientStatusResponse, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl ClientStatusDiscoveryService for AdsServer {
+    type StreamClientStatusStream = ClientStatusResponsestream;
+
+    async fn stream_client_status(
+        &self,
+        _request: Request<Streaming<ClientStatusRequest>>,
+    ) -> Result<Response<Self::StreamClientStatusStream>, Status> {
+        return Err(Status::unimplemented(
+            "streaming client status is not supported",
+        ));
+    }
+
+    async fn fetch_client_status(
+        &self,
+        request: Request<ClientStatusRequest>,
+    ) -> Result<Response<ClientStatusResponse>, Status> {
+        let request = request.into_inner();
+        if !request.node_matchers.is_empty() {
+            return Err(Status::invalid_argument("node_matchers are unsupported"));
+        }
+
+        let mut config = vec![];
+        for conn_snapshot in self.clients.iter() {
+            let mut generic_xds_configs = vec![];
+
+            let node = conn_snapshot.node().clone();
+            for (rtype, sub_state) in conn_snapshot.subscriptions() {
+                let type_url = rtype.type_url();
+                let config_status = if sub_state.applied {
+                    ConfigStatus::Synced
+                } else {
+                    ConfigStatus::Error
+                };
+
+                for (name, version) in &sub_state.sent {
+                    generic_xds_configs.push(GenericXdsConfig {
+                        type_url: type_url.to_string(),
+                        name: name.to_string(),
+                        version_info: version.to_string(),
+                        config_status: config_status.into(),
+                        ..Default::default()
+                    });
+                }
+            }
+
+            config.push(ClientConfig {
+                node: Some(node),
+                generic_xds_configs,
+                ..Default::default()
+            });
+        }
+
+        Ok(Response::new(ClientStatusResponse { config }))
     }
 }

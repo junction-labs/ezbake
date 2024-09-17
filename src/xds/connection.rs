@@ -1,8 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
     str::FromStr,
+    sync::Arc,
 };
 
+use crossbeam_skiplist::SkipMap;
 use enum_map::EnumMap;
 use smol_str::{SmolStr, ToSmolStr};
 use xds_api::pb::envoy::{
@@ -38,33 +41,97 @@ pub(crate) struct AdsConnection {
     subscriptions: EnumMap<ResourceType, Option<AdsSubscription>>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct ConnectionSnapshot {
+    connections: Arc<SkipMap<ConnectionSnapshotKey, AdsConnectionInfo>>,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ConnectionSnapshotKey {
+    cluster: String,
+    id: String,
+    remote_addr: Option<SocketAddr>,
+}
+
+impl ConnectionSnapshotKey {
+    fn new(node: &xds_node::Node, remote_addr: Option<SocketAddr>) -> Self {
+        Self {
+            id: node.id.clone(),
+            cluster: node.cluster.clone(),
+            remote_addr,
+        }
+    }
+}
+
+pub(crate) struct AdsConnectionInfo {
+    node: xds_node::Node,
+    subscriptions: EnumMap<ResourceType, Option<AdsSubscription>>,
+}
+
+impl ConnectionSnapshot {
+    pub(crate) fn update(&self, conn: &AdsConnection, socket_addr: Option<SocketAddr>) {
+        let key = ConnectionSnapshotKey::new(&conn.node, socket_addr);
+        let node = conn.node.clone();
+
+        self.connections.insert(
+            key,
+            AdsConnectionInfo {
+                node,
+                subscriptions: conn.subscriptions(),
+            },
+        );
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = ConnectionSnapshotEntry> {
+        self.connections.iter().map(ConnectionSnapshotEntry)
+    }
+}
+
+pub(crate) struct ConnectionSnapshotEntry<'a>(
+    crossbeam_skiplist::map::Entry<'a, ConnectionSnapshotKey, AdsConnectionInfo>,
+);
+
+impl<'a> ConnectionSnapshotEntry<'a> {
+    pub(crate) fn node(&self) -> &xds_node::Node {
+        &self.0.value().node
+    }
+
+    pub(crate) fn subscriptions(&self) -> impl Iterator<Item = (ResourceType, &AdsSubscription)> {
+        let sub_map = &self.0.value().subscriptions;
+
+        sub_map
+            .iter()
+            .filter_map(|(r, s)| Option::zip(Some(r), s.as_ref()))
+    }
+}
+
 /// The state of a subscription to an resource type, managed as part of an
 /// [AdsConnection].
-#[derive(Debug, Default)]
-struct AdsSubscription {
-    // the names that the client is subscribed to
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AdsSubscription {
+    /// the names that the client is subscribed to
     names: ResourceNames,
 
-    // the version of the last response sent
-    last_sent_version: Option<ResourceVersion>,
+    /// the version of the last response sent
+    pub(crate) last_sent_version: Option<ResourceVersion>,
 
-    // the nonce of the last reseponse sent
-    last_sent_nonce: Option<SmolStr>,
+    /// the nonce of the last reseponse sent
+    pub(crate) last_sent_nonce: Option<SmolStr>,
 
-    // the last version of each resource sent back to the client
-    //
-    // this isn't used to verify what resources were sent for LDS/CDS, but is
-    // kept to track state for CSDS.
-    sent: BTreeMap<SmolStr, SmolStr>,
+    /// the last version of each resource sent back to the client
+    ///
+    /// this isn't used to verify what resources were sent for LDS/CDS, but is
+    /// kept to track state for CSDS.
+    pub(crate) sent: BTreeMap<SmolStr, SmolStr>,
 
-    // whether or not the client applied the last response
-    applied: bool,
+    /// whether or not the client applied the last response
+    pub(crate) applied: bool,
 
-    // the last version a client successfully ACK'd
-    last_ack_version: Option<ResourceVersion>,
+    /// the last version a client successfully ACK'd
+    pub(crate) last_ack_version: Option<ResourceVersion>,
 
-    // the last nonce a client successfully ACK'd
-    last_ack_nonce: Option<SmolStr>,
+    /// the last nonce a client successfully ACK'd
+    pub(crate) last_ack_nonce: Option<SmolStr>,
 }
 
 impl AdsConnection {
@@ -90,6 +157,10 @@ impl AdsConnection {
 
     pub(crate) fn node(&self) -> &xds_node::Node {
         &self.node
+    }
+
+    pub(crate) fn subscriptions(&self) -> EnumMap<ResourceType, Option<AdsSubscription>> {
+        self.subscriptions.clone()
     }
 
     pub(crate) fn handle_ads_request(

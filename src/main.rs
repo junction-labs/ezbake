@@ -11,6 +11,7 @@ use xds_api::pb::envoy::service::{
     endpoint::v3::endpoint_discovery_service_server::EndpointDiscoveryServiceServer,
     listener::v3::listener_discovery_service_server::ListenerDiscoveryServiceServer,
     route::v3::route_discovery_service_server::RouteDiscoveryServiceServer,
+    status::v3::client_status_discovery_service_server::ClientStatusDiscoveryServiceServer,
 };
 
 mod ingest;
@@ -96,15 +97,20 @@ async fn serve(addr: &str, snapshot: xds::Snapshot) -> anyhow::Result<()> {
         .with_service_name("envoy.service.route.v3.RouteDiscoveryService")
         .with_service_name("envoy.service.cluster.v3.ClusterDiscoveryService")
         .with_service_name("envoy.service.endpoint.v3.EndpointDiscoveryService")
+        .with_service_name("envoy.service.status.v3.ClientStatusDiscoveryService")
         .build()?;
 
     let server = Server::builder()
         .layer(grpc_access::layer!())
+        // ADS streaming
         .add_service(AggregatedDiscoveryServiceServer::new(ads_server.clone()))
+        // xDS fetch endpoints
         .add_service(ListenerDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(RouteDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(ClusterDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(EndpointDiscoveryServiceServer::new(ads_server.clone()))
+        // debugging
+        .add_service(ClientStatusDiscoveryServiceServer::new(ads_server.clone()))
         .add_service(reflection)
         .serve(addr.parse()?);
 
@@ -193,7 +199,7 @@ where
 {
     match (all_namespaces, namespace) {
         (true, _) => kube::Api::all(client.clone()),
-        (_, Some(namespace)) => kube::Api::namespaced(client.clone(), &namespace),
+        (_, Some(namespace)) => kube::Api::namespaced(client.clone(), namespace),
         _ => kube::Api::default_namespaced(client.clone()),
     }
 }
