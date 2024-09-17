@@ -7,6 +7,7 @@ use enum_map::EnumMap;
 use futures::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::{info, trace, warn};
 use xds_api::pb::envoy::service::{
     cluster::v3::cluster_discovery_service_server::ClusterDiscoveryService,
     discovery::v3::{
@@ -137,18 +138,38 @@ async fn stream_ads(
     send_response: tokio::sync::mpsc::Sender<Result<DiscoveryResponse, Status>>,
     snapshot: Snapshot,
 ) {
-    let initial_request = match requests.message().await {
-        Ok(Some(message)) => message,
-        Ok(None) => return,
-        Err(e) => todo!("handle message errors: {e}"),
-    };
+    macro_rules! handle_message {
+        ($message:expr) => {
+            match $message {
+                Ok(Some(msg)) => msg,
+                // the stream has ended
+                Ok(None) => return,
+                // the connection is hosed, just bail
+                Err(e) if io_source(&e).is_some() => {
+                    trace!(err = %e, "closing connection: ignoring io error");
+                    return;
+                },
+                // something actually went wrong!
+                Err(e) => {
+                    warn!(err = %e, "an unexpected error occurred, closing the connection");
+                    return;
+                },
+            }
+        }
+    }
+
+    let initial_request = handle_message!(requests.message().await);
     debug_xds_discovery_request!(None, &initial_request);
 
     let mut timer = CacheTimer::new(Duration::from_millis(500));
     let (mut conn, resource_type, responses) =
         match AdsConnection::from_initial_request(initial_request, snapshot) {
             Ok((conn, rtype, responses)) => (conn, rtype, responses),
-            Err(_) => todo!(),
+            Err(e) => {
+                info!(err = %e, "refusing connection: invalid initial request");
+                try_send!(send_response, Err(e.into_status()));
+                return;
+            }
         };
 
     if let Some(rtype) = resource_type {
@@ -165,13 +186,17 @@ async fn stream_ads(
                 (Some(resource_type), conn.handle_snapshot_update(resource_type))
             },
             request = requests.message() => {
-                let message = match request {
-                    Ok(Some(msg)) => msg,
-                    Ok(None) => return,
-                    Err(e) => todo!("handle message errors: {e}"),
-                };
+                let message = handle_message!(request);
                 debug_xds_discovery_request!(&conn.node, &message);
-                conn.handle_ads_request(message)
+
+                match conn.handle_ads_request(message) {
+                    Ok((rty, res)) => (rty, res),
+                    Err(e) => {
+                        info!(node = ?conn.node(), err = %e, "closing connection: invalid request");
+                        try_send!(send_response, Err(e.into_status()));
+                        return;
+                    },
+                }
             },
         };
 
@@ -182,6 +207,22 @@ async fn stream_ads(
             debug_xds_discovery_response!(&conn.node, &response);
             try_send!(send_response, Ok(response));
         }
+    }
+}
+
+fn io_source(status: &Status) -> Option<&std::io::Error> {
+    let mut err: &(dyn std::error::Error + 'static) = status;
+
+    loop {
+        if let Some(e) = err.downcast_ref::<std::io::Error>() {
+            return Some(e);
+        }
+
+        if let Some(e) = err.downcast_ref::<h2::Error>().and_then(|e| e.get_io()) {
+            return Some(e);
+        }
+
+        err = err.source()?;
     }
 }
 
