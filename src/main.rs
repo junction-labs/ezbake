@@ -2,9 +2,9 @@ use std::{future::Future, time::Duration};
 
 use clap::{Args, Parser};
 use k8s_openapi::api::{core::v1::Service, discovery::v1::EndpointSlice};
-use tonic::transport::Server;
+use tonic::{server::NamedService, transport::Server};
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
-use xds::TypedWriters;
+use xds::{AdsServer, TypedWriters};
 use xds_api::pb::envoy::service::{
     cluster::v3::cluster_discovery_service_server::ClusterDiscoveryServiceServer,
     discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer,
@@ -89,30 +89,45 @@ async fn main() {
 }
 
 async fn serve(addr: &str, snapshot: xds::Snapshot) -> anyhow::Result<()> {
-    let ads_server = xds::AdsServer::new(snapshot);
-    let reflection = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(xds_api::FILE_DESCRIPTOR_SET)
-        .with_service_name("envoy.service.discovery.v3.AggregatedDiscoveryService")
-        .with_service_name("envoy.service.listener.v3.ListenerDiscoveryService")
-        .with_service_name("envoy.service.route.v3.RouteDiscoveryService")
-        .with_service_name("envoy.service.cluster.v3.ClusterDiscoveryService")
-        .with_service_name("envoy.service.endpoint.v3.EndpointDiscoveryService")
-        .with_service_name("envoy.service.status.v3.ClientStatusDiscoveryService")
-        .build()?;
+    // tonic server structs have a ::NAME string that we register with
+    // the reflection server so that reflection only shows what we're
+    // implementing, instead of EVERY single xDS api.
+    //
+    // for whatever reason, this means that we have to explicitly re-register
+    // the reflection service name. BUT we can't refer to the type without
+    // knowing the generic, which is hidden, so we can't call ::NAME on the
+    // reflection service.
+    macro_rules! server_with_reflection {
+        ($ads_server:expr => [$($service_type:tt),* $(,)?] $(,)?) => {{
+            let reflection = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(xds_api::FILE_DESCRIPTOR_SET)
+                .with_service_name("grpc.reflection.v1alpha.ServerReflection");
 
-    let server = Server::builder()
-        .layer(grpc_access::layer!())
-        // ADS streaming
-        .add_service(AggregatedDiscoveryServiceServer::new(ads_server.clone()))
-        // xDS fetch endpoints
-        .add_service(ListenerDiscoveryServiceServer::new(ads_server.clone()))
-        .add_service(RouteDiscoveryServiceServer::new(ads_server.clone()))
-        .add_service(ClusterDiscoveryServiceServer::new(ads_server.clone()))
-        .add_service(EndpointDiscoveryServiceServer::new(ads_server.clone()))
-        // debugging
-        .add_service(ClientStatusDiscoveryServiceServer::new(ads_server.clone()))
-        .add_service(reflection)
-        .serve(addr.parse()?);
+            let mut server = Server::builder().layer(grpc_access::layer!());
+
+            $(
+                let svc = $service_type::new($ads_server.clone());
+                let reflection = reflection.with_service_name($service_type::<AdsServer>::NAME);
+                let server = server.add_service(svc);
+            )*
+
+            let server = server.add_service(reflection.build()?);
+            server
+        }};
+    }
+
+    let ads = xds::AdsServer::new(snapshot);
+    let server = server_with_reflection!(
+        ads => [
+            AggregatedDiscoveryServiceServer,
+            ListenerDiscoveryServiceServer,
+            RouteDiscoveryServiceServer,
+            ClusterDiscoveryServiceServer,
+            EndpointDiscoveryServiceServer,
+            ClientStatusDiscoveryServiceServer,
+        ],
+    );
+    let server = server.serve(addr.parse()?);
 
     server.await?;
     Ok(())
