@@ -45,7 +45,7 @@ jobs:
           toolchain: ${{ env.rust_stable }}
     - uses: Swatinem/rust-cache@v2
     - name: clippy
-      run: cargo clippy --all --tests --all-features --no-deps
+      run: cargo clippy --all --tests --all-features --no-deps -- -D warnings
   fmt:
     runs-on: ubuntu-latest
     steps:
