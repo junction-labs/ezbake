@@ -546,7 +546,7 @@ dependencies = [
  "enum-map",
  "futures",
  "gateway-api",
- "h2 0.3.26",
+ "h2 0.4.6",
  "http 0.2.12",
  "k8s-openapi",
  "kube",
