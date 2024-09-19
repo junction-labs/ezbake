@@ -13,8 +13,8 @@ use xds_api::pb::envoy::{
     service::discovery::v3::{DiscoveryRequest, DiscoveryResponse},
 };
 
-use crate::xds::cache::Snapshot;
 use crate::xds::resources::ResourceType;
+use crate::xds::{cache::Snapshot, is_nack};
 
 use super::cache::ResourceVersion;
 
@@ -31,14 +31,6 @@ impl ConnectionError {
     pub(crate) fn into_status(self) -> tonic::Status {
         tonic::Status::invalid_argument(self.to_string())
     }
-}
-
-pub(crate) struct AdsConnection {
-    #[allow(unused)]
-    node: xds_node::Node,
-    nonce: u64,
-    snapshot: Snapshot,
-    subscriptions: EnumMap<ResourceType, Option<AdsSubscription>>,
 }
 
 #[derive(Clone, Default)]
@@ -134,25 +126,37 @@ pub(crate) struct AdsSubscription {
     pub(crate) last_ack_nonce: Option<SmolStr>,
 }
 
+pub(crate) struct AdsConnection {
+    node: xds_node::Node,
+    nonce: u64,
+    snapshot: Snapshot,
+    subscriptions: EnumMap<ResourceType, Option<AdsSubscription>>,
+}
+
 impl AdsConnection {
     pub(crate) fn from_initial_request(
-        mut request: DiscoveryRequest,
+        request: &mut DiscoveryRequest,
         snapshot: Snapshot,
-    ) -> Result<(Self, Option<ResourceType>, Vec<DiscoveryResponse>), ConnectionError> {
-        let node = match request.node.take() {
-            Some(node) => node,
-            None => return Err(ConnectionError::MisingNode),
-        };
+    ) -> Result<Self, ConnectionError> {
+        match request.node.take() {
+            Some(node) => Ok(Self {
+                nonce: 0,
+                node,
+                snapshot,
+                subscriptions: EnumMap::default(),
+            }),
+            None => Err(ConnectionError::MisingNode),
+        }
+    }
 
-        let mut connection = Self {
+    #[cfg(test)]
+    fn test_new(node: xds_node::Node, snapshot: Snapshot) -> Self {
+        Self {
             nonce: 0,
             node,
             snapshot,
             subscriptions: EnumMap::default(),
-        };
-
-        let (rtype, responses) = connection.handle_ads_request(request)?;
-        Ok((connection, rtype, responses))
+        }
     }
 
     pub(crate) fn node(&self) -> &xds_node::Node {
@@ -351,11 +355,6 @@ fn next_nonce(nonce: &mut u64) -> SmolStr {
     nonce.to_smolstr()
 }
 
-#[inline]
-pub(crate) fn is_nack(r: &DiscoveryRequest) -> bool {
-    r.error_detail.is_some()
-}
-
 /// A set of XDS resource names for tracking connection state.
 ///
 /// LDS and CDS have some extra-special wildcard handling that requires
@@ -461,47 +460,43 @@ mod test {
     #[test]
     fn test_init_no_data() {
         let snapshot = new_snapshot([]);
-        let node = Some(xds_core::Node {
+        let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
-        });
+        };
 
         // LDS and CDS should respond with no data
-        let (_conn, _, responses) = AdsConnection::from_initial_request(
-            discovery_request(ResourceType::Listener, node.clone(), "", "", vec![]),
-            snapshot.clone(),
-        )
-        .unwrap();
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, responses) = conn
+            .handle_ads_request(discovery_request(ResourceType::Listener, "", "", vec![]))
+            .unwrap();
         assert!(responses.is_empty());
 
-        let (_conn, _, responses) = AdsConnection::from_initial_request(
-            discovery_request(ResourceType::Cluster, node.clone(), "", "", vec![]),
-            snapshot.clone(),
-        )
-        .unwrap();
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, responses) = conn
+            .handle_ads_request(discovery_request(ResourceType::Cluster, "", "", vec![]))
+            .unwrap();
         assert!(responses.is_empty());
 
         // EDS should return nothing
-        let (_conn, _, responses) = AdsConnection::from_initial_request(
-            discovery_request(
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, responses) = conn
+            .handle_ads_request(discovery_request(
                 ResourceType::ClusterLoadAssignment,
-                node.clone(),
                 "",
                 "",
                 vec![],
-            ),
-            snapshot.clone(),
-        )
-        .unwrap();
+            ))
+            .unwrap();
         assert!(responses.is_empty(), "EDS returns an no responses");
     }
 
     #[test]
     fn test_init_with_data() {
-        let node = Some(xds_core::Node {
+        let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
-        });
+        };
 
         let snapshot = new_snapshot([
             (ResourceType::Listener, 123, vec!["default/nginx"]),
@@ -518,37 +513,33 @@ mod test {
         ]);
 
         // LDS should respond with a single message containing one resource
-        let (_, _, resp) = AdsConnection::from_initial_request(
-            discovery_request(ResourceType::Listener, node.clone(), "", "", vec![]),
-            snapshot.clone(),
-        )
-        .unwrap();
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(ResourceType::Listener, "", "", vec![]))
+            .unwrap();
         assert_eq!(resp.len(), 1);
         assert_eq!(resp[0].type_url, ResourceType::Listener.type_url());
         assert_eq!(resp[0].resources.len(), 1);
 
         // CDS shoudl respond with a single message containing both resources
-        let (_, _, resp) = AdsConnection::from_initial_request(
-            discovery_request(ResourceType::Cluster, node.clone(), "", "", vec![]),
-            snapshot.clone(),
-        )
-        .unwrap();
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(ResourceType::Cluster, "", "", vec![]))
+            .unwrap();
         assert_eq!(resp.len(), 1);
         assert_eq!(resp[0].type_url, ResourceType::Cluster.type_url());
         assert_eq!(resp[0].resources.len(), 2);
 
         // EDS should only fetch the requested resource
-        let (_, _, resp) = AdsConnection::from_initial_request(
-            discovery_request(
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(
                 ResourceType::ClusterLoadAssignment,
-                node.clone(),
                 "",
                 "",
                 vec!["default/nginx/endpoints", "default/nginx-staging/endpoints"],
-            ),
-            snapshot.clone(),
-        )
-        .unwrap();
+            ))
+            .unwrap();
         assert_eq!(resp.len(), 2);
         assert_eq!(
             resp[0].type_url,
@@ -559,10 +550,10 @@ mod test {
 
     #[test]
     fn test_lds_ack() {
-        let node = Some(xds_core::Node {
+        let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
-        });
+        };
 
         let snapshot = new_snapshot([
             (ResourceType::Listener, 123, vec!["default/nginx"]),
@@ -578,11 +569,10 @@ mod test {
             ),
         ]);
 
-        let (mut conn, _, resp) = AdsConnection::from_initial_request(
-            discovery_request(ResourceType::Listener, node.clone(), "", "", vec![]),
-            snapshot.clone(),
-        )
-        .unwrap();
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(ResourceType::Listener, "", "", vec![]))
+            .unwrap();
         assert_eq!(resp.len(), 1);
         assert_eq!(resp[0].type_url, ResourceType::Listener.type_url());
         assert_eq!(resp[0].resources.len(), 1);
@@ -615,10 +605,10 @@ mod test {
 
     #[test]
     fn test_handle_nack() {
-        let node = Some(xds_core::Node {
+        let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
-        });
+        };
 
         let snapshot = new_snapshot([
             (ResourceType::Listener, 123, vec!["default/nginx"]),
@@ -634,11 +624,10 @@ mod test {
             ),
         ]);
 
-        let (mut conn, _, resp) = AdsConnection::from_initial_request(
-            discovery_request(ResourceType::Listener, node.clone(), "", "", vec![]),
-            snapshot.clone(),
-        )
-        .unwrap();
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(ResourceType::Listener, "", "", vec![]))
+            .unwrap();
         assert_eq!(resp.len(), 1);
         assert_eq!(resp[0].type_url, ResourceType::Listener.type_url());
         assert_eq!(resp[0].resources.len(), 1);
@@ -677,10 +666,10 @@ mod test {
 
     #[test]
     fn test_handle_ack_as_update_cds() {
-        let node = Some(xds_core::Node {
+        let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
-        });
+        };
 
         let snapshot = new_snapshot([
             (ResourceType::Listener, 123, vec!["default/nginx"]),
@@ -696,11 +685,10 @@ mod test {
             ),
         ]);
 
-        let (mut conn, _, resp) = AdsConnection::from_initial_request(
-            discovery_request(ResourceType::Cluster, node.clone(), "", "", vec![]),
-            snapshot.clone(),
-        )
-        .unwrap();
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(ResourceType::Cluster, "", "", vec![]))
+            .unwrap();
         assert_eq!(resp.len(), 1);
         assert_eq!(resp[0].type_url, ResourceType::Cluster.type_url());
         assert_eq!(resp[0].resources.len(), 2);
@@ -754,10 +742,10 @@ mod test {
 
     #[test]
     fn test_eds_update_remove_subscription() {
-        let node = Some(xds_core::Node {
+        let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
-        });
+        };
 
         let snapshot = new_snapshot([
             (ResourceType::Listener, 123, vec!["default/nginx"]),
@@ -774,17 +762,15 @@ mod test {
         ]);
 
         // Initial EDS connection should return a a message for each EDS resource.
-        let (mut conn, _, resp) = AdsConnection::from_initial_request(
-            discovery_request(
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(
                 ResourceType::ClusterLoadAssignment,
-                node.clone(),
                 "",
                 "",
                 vec![],
-            ),
-            snapshot.clone(),
-        )
-        .unwrap();
+            ))
+            .unwrap();
 
         assert_eq!(resp.len(), 2);
         assert!(
@@ -843,10 +829,10 @@ mod test {
 
     #[test]
     fn test_eds_update_add_subscription() {
-        let node = Some(xds_core::Node {
+        let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
-        });
+        };
 
         let snapshot = new_snapshot([
             (ResourceType::Listener, 123, vec!["default/nginx"]),
@@ -862,17 +848,15 @@ mod test {
             ),
         ]);
 
-        let (mut conn, _, resp) = AdsConnection::from_initial_request(
-            discovery_request(
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(
                 ResourceType::ClusterLoadAssignment,
-                node.clone(),
                 "",
                 "",
                 vec!["default/nginx/endpoints"],
-            ),
-            snapshot.clone(),
-        )
-        .unwrap();
+            ))
+            .unwrap();
 
         // should return a single response
         assert_eq!(resp.len(), 1);
@@ -950,7 +934,6 @@ mod test {
 
     fn discovery_request(
         rtype: ResourceType,
-        node: Option<xds_core::Node>,
         version_info: &str,
         response_nonce: &str,
         names: Vec<&'static str>,
@@ -958,7 +941,6 @@ mod test {
         let names = names.into_iter().map(|n| n.to_string()).collect();
         DiscoveryRequest {
             type_url: rtype.type_url().to_string(),
-            node,
             resource_names: names,
             version_info: version_info.to_string(),
             response_nonce: response_nonce.to_string(),

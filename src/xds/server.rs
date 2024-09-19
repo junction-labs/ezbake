@@ -8,7 +8,7 @@ use enum_map::EnumMap;
 use futures::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{info, trace, warn};
+use tracing::{info, trace, warn, Span};
 use xds_api::pb::envoy::service::{
     cluster::v3::cluster_discovery_service_server::ClusterDiscoveryService,
     discovery::v3::{
@@ -25,7 +25,10 @@ use xds_api::pb::envoy::service::{
     },
 };
 
-use crate::xds::{AdsConnection, ResourceType, Snapshot};
+use crate::{
+    grpc_access,
+    xds::{AdsConnection, ResourceType, Snapshot},
+};
 
 use super::connection::ConnectionSnapshot;
 
@@ -50,6 +53,8 @@ impl AdsServer {
     ) -> Result<Response<DiscoveryResponse>, Status> {
         let request = request.into_inner();
 
+        grpc_access::xds_discovery_request(&request);
+
         let Some(snapshot_version) = self.snapshot.version(resource_type) else {
             return Err(Status::unavailable("no snapshot available"));
         };
@@ -73,11 +78,14 @@ impl AdsServer {
             }
         };
 
-        Ok(Response::new(DiscoveryResponse {
+        let response = DiscoveryResponse {
             version_info: snapshot_version.to_string(),
             resources,
             ..Default::default()
-        }))
+        };
+        grpc_access::xds_discovery_response(&response);
+
+        Ok(Response::new(response))
     }
 }
 
@@ -90,31 +98,15 @@ macro_rules! try_send {
     };
 }
 
-macro_rules! debug_xds_discovery_request {
-    ($node:expr, $request:expr) => {
-        tracing::debug!(
-            nack = crate::xds::connection::is_nack(&$request),
-            "DiscoveryRequest(v={:?}, n={:?}, ty={:?}, r={:?})",
-            $request.version_info,
-            $request.response_nonce,
-            $request.type_url,
-            $request.resource_names,
-        );
-    };
-}
-
-macro_rules! debug_xds_discovery_response {
-    ($node:expr, $response:expr) => {
-        tracing::debug!(
-            "DiscoveryResponse(v={:?}, n={:?}, ty={:?}, r_count={:?})",
-            $response.version_info,
-            $response.nonce,
-            $response.type_url,
-            $response.resources.len(),
-        );
-    };
-}
-
+#[tracing::instrument(
+    level = "info",
+    skip_all,
+    fields(
+        remote_addr = tracing::field::Empty,
+        node_id = tracing::field::Empty,
+        node_cluster = tracing::field::Empty,
+    )
+)]
 async fn stream_ads(
     snapshot: Snapshot,
     clients: ConnectionSnapshot,
@@ -122,6 +114,12 @@ async fn stream_ads(
     mut requests: Streaming<DiscoveryRequest>,
     send_response: tokio::sync::mpsc::Sender<Result<DiscoveryResponse, Status>>,
 ) {
+    // ?remote_addr shows us Some(_) when an addr is present and %remote_addr
+    // doesn't compile. this is annoying but do it anyway.
+    if let Some(addr) = remote_addr {
+        Span::current().record("remote_addr", addr.to_string());
+    }
+
     macro_rules! handle_message {
         ($message:expr) => {
             match $message {
@@ -142,29 +140,49 @@ async fn stream_ads(
         }
     }
 
-    let initial_request = handle_message!(requests.message().await);
-    debug_xds_discovery_request!(None, &initial_request);
+    // pull the Node out of the initial request and add the current node info to
+    // the current span so we can forget about it for the rest of the stream.
+    let mut initial_request = handle_message!(requests.message().await);
+    let mut conn = match AdsConnection::from_initial_request(&mut initial_request, snapshot) {
+        Ok(conn) => conn,
+        Err(e) => {
+            info!(err = %e, "refusing connection: invalid initial request");
+            try_send!(send_response, Err(e.into_status()));
+            return;
+        }
+    };
+
+    let node = conn.node();
+    let current_span = Span::current();
+    current_span.record("node_id", &node.id);
+    current_span.record("node_cluster", &node.cluster);
+
+    // first round of message handling.
+    //
+    // this is *almost* identical to handling any subsequent message, but there
+    // are no interrupts from snapshot updates that we might have to handle yet.
+    grpc_access::xds_discovery_request(&initial_request);
 
     let mut timer = CacheTimer::new(Duration::from_millis(500));
-    let (mut conn, resource_type, responses) =
-        match AdsConnection::from_initial_request(initial_request, snapshot) {
-            Ok((conn, rtype, responses)) => (conn, rtype, responses),
-            Err(e) => {
-                info!(err = %e, "refusing connection: invalid initial request");
-                try_send!(send_response, Err(e.into_status()));
-                return;
-            }
-        };
-
+    let (resource_type, responses) = match conn.handle_ads_request(initial_request) {
+        Ok((rty, res)) => (rty, res),
+        Err(e) => {
+            info!(node = ?conn.node(), err = %e, "closing connection: invalid request");
+            try_send!(send_response, Err(e.into_status()));
+            return;
+        }
+    };
     if let Some(rtype) = resource_type {
         timer.touch(rtype, Instant::now())
     }
     for response in responses {
-        debug_xds_discovery_response!(&conn.node, &response);
+        grpc_access::xds_discovery_response(&response);
         try_send!(send_response, Ok(response));
     }
     clients.update(&conn, remote_addr);
 
+    // respond to either an incoming request or a snapshot update until the client
+    // goes away.
     loop {
         let (rtype, responses) = tokio::select! {
             resource_type = timer.wait() => {
@@ -172,7 +190,7 @@ async fn stream_ads(
             },
             request = requests.message() => {
                 let message = handle_message!(request);
-                debug_xds_discovery_request!(&conn.node, &message);
+                grpc_access::xds_discovery_request(&message);
 
                 match conn.handle_ads_request(message) {
                     Ok((rty, res)) => (rty, res),
@@ -189,7 +207,7 @@ async fn stream_ads(
             timer.touch(rtype, Instant::now())
         }
         for response in responses {
-            debug_xds_discovery_response!(&conn.node, &response);
+            grpc_access::xds_discovery_response(&response);
             try_send!(send_response, Ok(response));
         }
         clients.update(&conn, remote_addr);

@@ -3,7 +3,7 @@ use std::{future::Future, time::Duration};
 use clap::{Args, Parser};
 use k8s_openapi::api::{core::v1::Service, discovery::v1::EndpointSlice};
 use tonic::{server::NamedService, transport::Server};
-use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
+use tracing_subscriber::EnvFilter;
 use xds::{AdsServer, TypedWriters};
 use xds_api::pb::envoy::service::{
     cluster::v3::cluster_discovery_service_server::ClusterDiscoveryServiceServer,
@@ -14,6 +14,7 @@ use xds_api::pb::envoy::service::{
     status::v3::client_status_discovery_service_server::ClientStatusDiscoveryServiceServer,
 };
 
+mod grpc_access;
 mod ingest;
 mod k8s;
 mod xds;
@@ -26,6 +27,10 @@ mod xds;
 #[derive(Parser, Debug)]
 #[command(version)]
 struct CliArgs {
+    /// Log in a pretty, human-readable format.
+    #[arg(long)]
+    log_pretty: bool,
+
     /// The local address to listen on.
     #[arg(long, short, default_value = "127.0.0.1:8008")]
     listen_addr: String,
@@ -55,23 +60,10 @@ struct NamespaceArgs {
 
 #[tokio::main]
 async fn main() {
-    let default_log_filter = "ezbake=info"
-        .parse()
-        .expect("default log filter must be valid");
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(default_log_filter)
-                .from_env_lossy(),
-        )
-        .with_span_events(FmtSpan::CLOSE)
-        .with_target(true)
-        .init();
+    let args = CliArgs::parse();
+    setup_tracing(args.log_pretty);
 
     let client = kube::Client::try_default().await.unwrap();
-
-    let args = CliArgs::parse();
     let (snapshot, writers) = xds::new_snapshot();
 
     let ingest = ingest(
@@ -85,6 +77,33 @@ async fn main() {
     if let Err(e) = tokio::try_join!(ingest, serve) {
         tracing::error!(err = ?e, "exiting: {e}");
         std::process::exit(1);
+    }
+}
+
+fn setup_tracing(log_pretty: bool) {
+    let default_log_filter = "ezbake=info"
+        .parse()
+        .expect("default log filter must be valid");
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(default_log_filter)
+                .from_env_lossy(),
+        )
+        .with_target(true);
+
+    if log_pretty {
+        // don't use .pretty(), it's too pretty
+        builder.init();
+    } else {
+        builder
+            .json()
+            .flatten_event(true)
+            // TODO: we're not really emitting events from deeply nested spans
+            // often, and the span list is redundant with the current span.
+            // omit it for now.
+            .with_span_list(false)
+            .init();
     }
 }
 
@@ -230,68 +249,5 @@ where
         Ok(Ok(val)) => Ok(val),
         Ok(Err(e)) => Err(e.into()),
         Err(e) => Err(e.into()),
-    }
-}
-
-pub(crate) mod grpc_access {
-    use std::time::Duration;
-
-    use tower_http::classify::GrpcFailureClass;
-    use tracing::{info_span, Span};
-
-    macro_rules! layer {
-        () => {
-            tower_http::trace::TraceLayer::new_for_grpc()
-                .make_span_with(crate::grpc_access::make_span)
-                .on_request(crate::grpc_access::on_request)
-                .on_response(crate::grpc_access::on_response)
-                .on_eos(crate::grpc_access::on_eos)
-                .on_failure(crate::grpc_access::on_failure)
-        };
-    }
-    pub(crate) use layer;
-
-    pub(crate) fn make_span(request: &http::Request<tonic::transport::Body>) -> Span {
-        info_span!(
-            "grpc-access",
-            method = %request.method(),
-            uri = %request.uri(),
-            version = ?request.version()
-        )
-    }
-
-    pub(crate) fn on_request(_request: &http::Request<tonic::transport::Body>, _span: &Span) {
-        tracing::info!("request-recieved")
-    }
-
-    pub(crate) fn on_response<B>(_response: &http::Response<B>, latency: Duration, _span: &Span) {
-        let latency_us = latency.as_micros();
-        tracing::info!(%latency_us, "response-sent")
-    }
-
-    pub(crate) fn on_eos(
-        trailers: Option<&http::HeaderMap>,
-        stream_duration: Duration,
-        _span: &Span,
-    ) {
-        let status_code = trailers
-            .and_then(tonic::Status::from_header_map)
-            .map(|status| status.code());
-
-        let duration_us = stream_duration.as_micros();
-        tracing::info!(?status_code, %duration_us, "end-of-stream")
-    }
-
-    pub(crate) fn on_failure(
-        failure_classification: GrpcFailureClass,
-        latency: Duration,
-        _span: &Span,
-    ) {
-        let duration_us = latency.as_micros();
-        tracing::info!(
-            classification = %failure_classification,
-            %duration_us,
-            "failed"
-        )
     }
 }
