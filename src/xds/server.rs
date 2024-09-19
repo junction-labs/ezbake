@@ -6,6 +6,7 @@ use std::{
 
 use enum_map::EnumMap;
 use futures::Stream;
+use metrics::counter;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, trace, warn, Span};
@@ -114,16 +115,30 @@ async fn stream_ads(
     mut requests: Streaming<DiscoveryRequest>,
     send_response: tokio::sync::mpsc::Sender<Result<DiscoveryResponse, Status>>,
 ) {
+    let _conn_active = crate::metrics::scoped_gauge!("ads.active_connections", 1);
+
     // ?remote_addr shows us Some(_) when an addr is present and %remote_addr
     // doesn't compile. this is annoying but do it anyway.
     if let Some(addr) = remote_addr {
         Span::current().record("remote_addr", addr.to_string());
     }
 
-    macro_rules! handle_message {
+    macro_rules! send_xds {
+        ($chan:expr, $message:expr) => {
+            grpc_access::xds_discovery_response(&$message);
+            try_send!($chan, Ok($message));
+            counter!("ads.tx").increment(1);
+        };
+    }
+
+    macro_rules! recv_xds {
         ($message:expr) => {
             match $message {
-                Ok(Some(msg)) => msg,
+                Ok(Some(msg)) => {
+                    grpc_access::xds_discovery_request(&msg);
+                    counter!("ads.rx").increment(1);
+                    msg
+                },
                 // the stream has ended
                 Ok(None) => return,
                 // the connection is hosed, just bail
@@ -142,7 +157,7 @@ async fn stream_ads(
 
     // pull the Node out of the initial request and add the current node info to
     // the current span so we can forget about it for the rest of the stream.
-    let mut initial_request = handle_message!(requests.message().await);
+    let mut initial_request = recv_xds!(requests.message().await);
     let mut conn = match AdsConnection::from_initial_request(&mut initial_request, snapshot) {
         Ok(conn) => conn,
         Err(e) => {
@@ -161,8 +176,6 @@ async fn stream_ads(
     //
     // this is *almost* identical to handling any subsequent message, but there
     // are no interrupts from snapshot updates that we might have to handle yet.
-    grpc_access::xds_discovery_request(&initial_request);
-
     let mut timer = CacheTimer::new(Duration::from_millis(500));
     let (resource_type, responses) = match conn.handle_ads_request(initial_request) {
         Ok((rty, res)) => (rty, res),
@@ -176,8 +189,7 @@ async fn stream_ads(
         timer.touch(rtype, Instant::now())
     }
     for response in responses {
-        grpc_access::xds_discovery_response(&response);
-        try_send!(send_response, Ok(response));
+        send_xds!(send_response, response);
     }
     clients.update(&conn, remote_addr);
 
@@ -189,8 +201,7 @@ async fn stream_ads(
                 (Some(resource_type), conn.handle_snapshot_update(resource_type))
             },
             request = requests.message() => {
-                let message = handle_message!(request);
-                grpc_access::xds_discovery_request(&message);
+                let message = recv_xds!(request);
 
                 match conn.handle_ads_request(message) {
                     Ok((rty, res)) => (rty, res),
@@ -207,8 +218,7 @@ async fn stream_ads(
             timer.touch(rtype, Instant::now())
         }
         for response in responses {
-            grpc_access::xds_discovery_response(&response);
-            try_send!(send_response, Ok(response));
+            send_xds!(send_response, response);
         }
         clients.update(&conn, remote_addr);
     }

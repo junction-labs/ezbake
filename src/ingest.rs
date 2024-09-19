@@ -90,6 +90,9 @@ impl Listeners {
                         break;
                     };
 
+                    // time the rest of the select block
+                    let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "Listener", "kube_kind" => "Service");
+
                     let updates = objs.iter().map(|obj_ref| self.service_changed(&obj_ref.obj));
                     let version = self.version_counter.next();
                     self.writer.update(version, updates);
@@ -100,6 +103,9 @@ impl Listeners {
                         debug!(resource_type = ?crate::xds::ResourceType::Listener, "ingest exiting");
                         break;
                     };
+
+                    // time the rest of the select block
+                    let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "Listener", "kube_kind" => "HTTPRoute");
 
                     let updates = objs.iter().flat_map(|obj_ref| self.route_changed(obj_ref));
                     let version = self.version_counter.next();
@@ -193,6 +199,9 @@ impl Clusters {
                 break;
             };
 
+            // time each iteration of the loop
+            let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "Cluster", "kube_kind" => "Service");
+
             let updates = services
                 .iter()
                 .map(|svc_ref| self.service_changed(&svc_ref.obj));
@@ -247,6 +256,9 @@ impl LoadAssignments {
                 debug!(resource_type = ?crate::xds::ResourceType::ClusterLoadAssignment, "ingest exiting");
                 break;
             };
+
+            // time each iteration of the loop
+            let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "ClusterLoadAssignment", "kube_kind" => "EndpointSlice");
 
             let mut changed_svcs = HashSet::new();
             for slice_ref in slice_refs.iter() {

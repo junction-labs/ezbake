@@ -19,6 +19,8 @@ mod ingest;
 mod k8s;
 mod xds;
 
+pub(crate) mod metrics;
+
 // TODO: multi-cluster
 // TODO: actually figure out metrics/logs/etc. would be nice to have a flag that
 //       dumps XDS requests in a chrome trace format or something.
@@ -31,9 +33,13 @@ struct CliArgs {
     #[arg(long)]
     log_pretty: bool,
 
-    /// The local address to listen on.
+    /// The address to listen on.
     #[arg(long, short, default_value = "127.0.0.1:8008")]
     listen_addr: String,
+
+    /// The address to expose metrics on.
+    #[arg(long, default_value = "127.0.0.1:8009")]
+    metrics_addr: String,
 
     #[command(flatten)]
     namespace_args: NamespaceArgs,
@@ -63,6 +69,14 @@ async fn main() {
     let args = CliArgs::parse();
     setup_tracing(args.log_pretty);
 
+    if let Err(e) = crate::metrics::install_prom(&args.metrics_addr) {
+        tracing::error!(
+            "invalid metrics addr: '{addr}': {e}",
+            addr = args.metrics_addr
+        );
+        std::process::exit(1);
+    }
+
     let client = kube::Client::try_default().await.unwrap();
     let (snapshot, writers) = xds::new_snapshot();
 
@@ -80,6 +94,10 @@ async fn main() {
     }
 }
 
+/// Set up a tracing exporter.
+///
+/// This is here and not in grpc_access because tracing covers much more surface area
+/// than just grpc.
 fn setup_tracing(log_pretty: bool) {
     let default_log_filter = "ezbake=info"
         .parse()
