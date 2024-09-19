@@ -12,7 +12,7 @@ futures = "0.3"
 gateway-api = "0.10"
 h2 = "0.3"
 http = "0.2"
-k8s-openapi = { version = "0.21", features = ["v1_29"] }
+k8s-openapi = { version = "0.23", features = ["v1_29"] }
 kube = { version = "0.88", features = ["runtime", "client", "derive"] }
 metrics = "0.23.0"
 metrics-exporter-prometheus = { version = "0.15.3", default-features = false, features = [
