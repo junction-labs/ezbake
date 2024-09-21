@@ -57,32 +57,36 @@ kubectl apply -f ./scripts/install-for-cluster.yml
 ```
 
 On a cluster where you only have access to a namespace, this simpler install
-will set up  a `deployment` and `service` for `ezbake` within it. 
+will set up  a `deployment` and `service` for `ezbake` within it. However it still 
+requires your administrator to do some setup. 
 
-First, if you wish to use the Gateway API CRDs, then an admin must install them with:
+First, to enable ezbake's dynamic configuration capabilities, your administrator will 
+need to install the cluster-wise Gateway API CRDs:
 
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
 ```
 
-Secondly, if even within the namespace your services are locked down from accessing the 
-API server, your admin must create a service account with permissions by updating `foo`
-as needed and then running
+Finally, they must create a service account that has permissions for pulling
+from the API server, by editing `foo` to your namespace and then running:
 ```bash
 kubectl apply -f ./scripts/install-for-namespace-admin.yml 
 ```
 
-Finally, to run ezbake in your namespace, update `foo` to your namespace and start ezbake with:
+That is all that is needed from your administator. Now all you need to do is editing `foo` 
+to your namespace and start ezbake with:
 ```bash
 kubectl apply -f ./scripts/install-for-namespace.yml 
 ```
 
-## Using the Junction Gateway API extended policies
+## Dynamic configration with the Junction Gateway API extended policies
 
-At this time, the Kubernetes Gateway API does not natively support many load 
+At this time, the Kubernetes Gateway API supports many capabilities for 
+routing traffic, but does not have much support for load balancing
 balancing features. We have thus created extended policies, defined at FIXME.
 
 At this point in time, we do not make them available as a CRD, as they
-are still in development. Instead, they can be flattened as service annotations
+are still in development. Instead, they are flattened as service annotations.
 
-FIXME
+FIXME heere
+
