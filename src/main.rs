@@ -34,11 +34,11 @@ struct CliArgs {
     log_pretty: bool,
 
     /// The address to listen on.
-    #[arg(long, short, default_value = "127.0.0.1:8008")]
+    #[arg(long, short, default_value = "0.0.0.0:8008")]
     listen_addr: String,
 
     /// The address to expose metrics on.
-    #[arg(long, default_value = "127.0.0.1:8009")]
+    #[arg(long, default_value = "0.0.0.0:8009")]
     metrics_addr: String,
 
     #[command(flatten)]
