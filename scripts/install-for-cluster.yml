@@ -63,6 +63,8 @@ spec:
       serviceAccountName: junction-account
       containers:
         - name: ezbake
+          command: ["./ezbake"]
+          args: ["--all-namespaces"]
           image: ezbake:latest
           imagePullPolicy: IfNotPresent
           env:

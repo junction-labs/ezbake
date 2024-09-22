@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: ezbake
-          args: ["-i", "default-namespace"]
+          command: ["./ezbake"]
           image: ezbake:latest
           imagePullPolicy: IfNotPresent
           env:
