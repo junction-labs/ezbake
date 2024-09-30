@@ -1,41 +1,64 @@
-# ezbake
+# `ezbake`
 
 `ezbake` is a single-binary service discovery server for your Kubernetes cluster
-that makes client-side load balancing and traffic routing for HTTP and GRPC
-services easy and accessible to everyone, even if you're allergic to YAML.
+that makes client-side load balancing easy and accessible to everyone, even if
+you're allergic to YAML. At this time ezbake is tested to support the [Junction
+HTTP client][junction-client]. In the future we will add support for proxyless
+[gRPC][grpc].
 
-`ezbake` watches the local Kubernetes cluster, and creates endpoints for all running ```Service``` 
-accessed using the xDS protocol (https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol). 
+`ezbake` watches the local Kubernetes cluster, and creates endpoints for all
+running k8s services, giving access to clients using the [xDS protocol][xds].
+`ezbake` also will pass through any [Gateway API HTTPRoute][httproute]
+configuration.
 
-At this time ezbake is tested to support two XDS clients:
-- junction-client (https://github.com/junction-labs/junction-client)
-- gRPC (https://grpc.io/)
+For the [Junction HTTP client][junction-client], `ezbake` will route all HTTP
+requests of the form `http://${name}.${namespace}.svc.cluster.local` to the
+service named `name` in the namespaced `namespace`. 
 
-For junction-client, `ezbake` will route all HTTP requests of the form `http-jct://${name}.${namespace}` 
-to the service named `name` in the namespaced `namespace`.
+[xds]: https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol
+[junction-client]: https://github.com/junction-labs/junction-client
+[grpc]: https://grpc.io/
+[httproute]: https://gateway-api.sigs.k8s.io/api-types/httproute/
 
-For gRPC, ezbake will route all requests for the endpoint `grpc://${name}.${namespace}` to the 
-service named `name` in the namespaced `namespace`.
+## Building and Running
 
-The junction-client allows richer XDS behaviour to be specified in the client code. Both
-options also support the Gateway API, documented below.
-
-For full samples, see https://github.com/junction-labs/junction-test
-
-## Building
-
-For running locally outside of Kubernetes:
+To build and run locally outside of k8s:
 ```bash
 cargo run
 ```
 
-For doing a native build docker say for running within orb:
+To instead build a native container, say for running within [OrbStack][orb]
+locally:
 ```bash
 docker build --tag ezbake --file ./scripts/Dockerfile-develop --load .
 ```
 
-For a multiarch container that comes with the cost of a slower build,
-you will need to do a one off installation of buildx:
+To run this container on a k8s cluster where you have full k8s administrative
+privilieges, the following will install `ezbake` in a new namespace called
+'junction':
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
+kubectl apply -f ./scripts/install-for-cluster.yml 
+```
+
+To install `ezbake` on a k8s cluster where you do not have full k8s
+administrative access, see the advanced directions below.
+
+To cleanup:
+```bash
+kubectl delete -f ./scripts/install-for-cluster.yml 
+kubectl delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
+```
+
+[orb]: https://orbstack.dev/
+
+## Advanced
+
+### Multiarch build
+
+To create a x86 and ARM64 multiarch build container that comes with the cost of
+a slower build, you will need to do a one off installation of buildx:
 ```bash
 docker buildx create --name mybuilder2 --use
 docker buildx install
@@ -46,46 +69,29 @@ Then:
 docker build --tag ezbake --file ./scripts/Dockerfile-multiarch --load .
 ```
 
-## Deploying to Kubernetes
+### Deploying to Kubernetes in a Single Namespace
 
-On a cluster where you have full administrative privilieges, this will 
-install `ezbake` with its own service account in the 'juction' namespace:
+On a cluster where you only have access to a single namespace, you can still run
+`ezbake`, but it does require your administrator to do some one-off setup. 
 
-```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
-kubectl apply -f ./scripts/install-for-cluster.yml 
-```
+#### For Administator
 
-On a cluster where you only have access to a namespace, this simpler install
-will set up  a `deployment` and `service` for `ezbake` within it. However it still 
-requires your administrator to do some setup. 
-
-First, to enable ezbake's dynamic configuration capabilities, your administrator will 
-need to install the cluster-wise Gateway API CRDs:
+You first need to install the cluster-wise Gateway API CRDs:
 
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
 ```
 
-Finally, they must create a service account that has permissions for pulling
-from the API server, by editing `foo` to your namespace and then running:
+Next, you must create a service account that has permissions for pulling from
+the API server, by editing `foo` to your user's namespace and running:
 ```bash
 kubectl apply -f ./scripts/install-for-namespace-admin.yml 
 ```
 
-That is all that is needed from your administator. Now all you need to do is editing `foo` 
-to your namespace and start ezbake with:
+#### For User
+
+Now as a user to start `ezbake`, all you need to do is edit `foo` in the
+following file to your namespace and apply it with:
 ```bash
 kubectl apply -f ./scripts/install-for-namespace.yml 
 ```
-
-## Dynamic configration with the Junction Gateway API extended policies
-
-At this time, the Kubernetes Gateway API supports many capabilities for 
-routing traffic, but does not have much support for load balancing
-balancing features. We have thus created extended policies, defined at FIXME.
-
-At this point in time, we do not make them available as a CRD, as they
-are still in development. Instead, they are flattened as service annotations.
-
-FIXME heere
