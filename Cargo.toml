@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.5.17", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.18", features = ["derive", "wrap_help"] }
 crossbeam-skiplist = "0.1"
 enum-map = "2.7"
 futures = "0.3"
