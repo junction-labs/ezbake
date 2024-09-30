@@ -24,7 +24,7 @@ thiserror = "1.0"
 tokio = { version = "1.38", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.11"
-tonic-reflection = "0.11"
+tonic-reflection = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower = "0.4"
