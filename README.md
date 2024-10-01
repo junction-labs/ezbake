@@ -20,19 +20,19 @@ service named `name` in the namespaced `namespace`.
 [grpc]: https://grpc.io/
 [httproute]: https://gateway-api.sigs.k8s.io/api-types/httproute/
 
-## Running Outside k8s
+## Running inside a shell
 
-To build and run locally outside of k8s:
+To build and run locally outside of k8s, using your user Kubernetes config:
 ```bash
 cargo run
 ```
 
-When using the Junction HTTP Client, you must then set up its environment variable with: 
+When using the Junction HTTP Client, you must then set up the shell's environment variable as: 
 ```bash
 export JUNCTION_ADS_SERVER="grpc://localhost:8008"
 ```
 
-## Running Inside k8s
+## Running inside k8s
 
 To instead build a native container, say for running within [OrbStack][orb]
 locally:
