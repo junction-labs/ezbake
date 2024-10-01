@@ -20,12 +20,19 @@ service named `name` in the namespaced `namespace`.
 [grpc]: https://grpc.io/
 [httproute]: https://gateway-api.sigs.k8s.io/api-types/httproute/
 
-## Building and Running
+## Running Outside k8s
 
 To build and run locally outside of k8s:
 ```bash
 cargo run
 ```
+
+When using the Junction HTTP Client, you must then set up its environment variable with: 
+```bash
+export JUNCTION_ADS_SERVER="grpc://localhost:8008"
+```
+
+## Running Inside k8s
 
 To instead build a native container, say for running within [OrbStack][orb]
 locally:
@@ -44,6 +51,11 @@ kubectl apply -f ./scripts/install-for-cluster.yml
 
 To install `ezbake` on a k8s cluster where you do not have full k8s
 administrative access, see the advanced directions below.
+
+When using the Junction HTTP Client, you must then set up its environmen variable with the following command:
+```bash
+export JUNCTION_ADS_SERVER="grpc://"`kubectl get svc ezbake --namespace junction -o jsonpath='{.spec.clusterIP}'`":8008"
+```
 
 To cleanup:
 ```bash
