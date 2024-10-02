@@ -35,6 +35,13 @@ impl ResourceVersion {
         Self(version.try_into().expect("masked a zero ResourceVersion"))
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_parts(prefix: u64, epoch_ms: u64) -> Self {
+        let prefix = prefix << 48;
+        let version = prefix | (epoch_ms & Self::EPOCH_MASK);
+        Self(version.try_into().expect("created a zero ResourceVersion"))
+    }
+
     fn as_parts(&self) -> (u64, u64) {
         let v = self.0.get();
         let prefix = (v & ResourceVersion::PREFIX_MASK) >> 48;
