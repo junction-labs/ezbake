@@ -2,7 +2,7 @@
 
 `ezbake` is a single-binary service discovery server for your Kubernetes cluster that makes
 client-side load balancing easy and accessible to everyone, even if you're allergic to YAML. At this
-time ezbake is tested to support the [Junction HTTP client][junction-client]. In the future we will
+time `ezbake` is tested to support the [Junction HTTP client][junction-client]. In the future we will
 add support for proxyless [gRPC][grpc].
 
 `ezbake` watches the local Kubernetes cluster, and creates endpoints for all running k8s services,
@@ -37,7 +37,7 @@ To instead build a native container, say for running within [OrbStack][orb] loca
 docker build --tag ezbake --file ./scripts/Dockerfile-develop --load .
 ```
 
-To run this container on a k8s cluster where you have full k8s administrative privilieges, the
+To run this container on a k8s cluster where you have full k8s administrative privileges, the
 following will install `ezbake` in a new namespace called 'junction':
 
 ```bash
@@ -48,7 +48,7 @@ kubectl apply -f ./scripts/install-for-cluster.yml
 To install `ezbake` on a k8s cluster where you do not have full k8s administrative access, see the
 advanced directions below.
 
-When using the Junction HTTP Client, you must then set up its environmen variable with the following
+When using the Junction HTTP Client, you must then set up its environment variable with the following
 command:
 ```bash
 export JUNCTION_ADS_SERVER="grpc://"`kubectl get svc ezbake --namespace junction -o jsonpath='{.spec.clusterIP}'`":8008"
@@ -83,7 +83,7 @@ docker build --tag ezbake --file ./scripts/Dockerfile-multiarch --load .
 On a cluster where you only have access to a single namespace, you can still run `ezbake`, but it
 does require your administrator to do some one-off setup. 
 
-#### For Administator
+#### For Administrator
 
 You first need to install the cluster-wise Gateway API CRDs:
 
