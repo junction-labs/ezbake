@@ -194,6 +194,14 @@ impl AdsConnection {
             .map_err(|e| ConnectionError::InvalidRequest(e.into()))?;
         let request_nonce = nonempty_then(&request.response_nonce, SmolStr::new);
         if request_nonce != sub.last_sent_nonce {
+            tracing::trace!(
+                v = request.version_info,
+                n = request.response_nonce,
+                ty = request.type_url,
+                r = ?request.resource_names,
+                last_sent_nonce = %sub.last_sent_nonce.as_ref().unwrap_or(&"".to_smolstr()),
+                "ignoring stale request",
+            );
             return empty_response!();
         }
 
@@ -322,7 +330,7 @@ impl AdsSubscription {
         let iter = snapshot_iter(rtype, &self.names, snapshot);
         let (size_hint, _) = iter.size_hint();
 
-        let mut last_nonce = 0;
+        let mut last_nonce = None;
         let mut responses = Vec::with_capacity(size_hint);
         for entry in iter {
             let name = entry.key();
@@ -333,17 +341,19 @@ impl AdsSubscription {
                 self.sent.insert(entry.key().to_smolstr(), resource_version);
                 responses.push(DiscoveryResponse {
                     type_url: rtype.type_url().to_string(),
-                    version_info: resource.version.to_string(),
+                    version_info: snapshot_version.to_string(),
                     nonce: next_nonce(nonce).to_string(),
                     resources: vec![resource.proto.clone()],
                     ..Default::default()
                 });
-                last_nonce = *nonce;
+                last_nonce = Some(*nonce);
             }
         }
 
-        self.last_sent_version = Some(snapshot_version);
-        self.last_sent_nonce = Some(last_nonce.to_smolstr());
+        if let Some(last_nonce) = last_nonce {
+            self.last_sent_version = Some(snapshot_version);
+            self.last_sent_nonce = Some(last_nonce.to_smolstr());
+        }
 
         responses
     }
@@ -452,13 +462,14 @@ impl<'n, 's> Iterator for SnapshotIter<'n, 's> {
 #[cfg(test)]
 mod test {
     use crate::xds::cache::ResourceVersion;
+    use crate::xds::SnapshotWriter;
 
     use super::*;
     use xds_api::pb::envoy::config::core::v3::{self as xds_core};
     use xds_api::pb::google::protobuf;
 
     #[test]
-    fn test_init_no_data() {
+    fn test_xds_init_no_data() {
         let snapshot = new_snapshot([]);
         let node = xds_core::Node {
             id: "test-node".to_string(),
@@ -492,23 +503,27 @@ mod test {
     }
 
     #[test]
-    fn test_init_with_data() {
+    fn test_xds_init_with_data() {
         let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
         };
 
         let snapshot = new_snapshot([
-            (ResourceType::Listener, 123, vec!["default/nginx"]),
+            (ResourceType::Listener, vec![(121, "default/nginx")]),
             (
                 ResourceType::Cluster,
-                123,
-                vec!["default/nginx/cluster", "default/nginx-staging/cluster"],
+                vec![
+                    (123, "default/nginx/cluster"),
+                    (127, "default/nginx-staging/cluster"),
+                ],
             ),
             (
                 ResourceType::ClusterLoadAssignment,
-                123,
-                vec!["default/nginx/endpoints", "default/nginx-staging/endpoints"],
+                vec![
+                    (124, "default/nginx/endpoints"),
+                    (125, "default/nginx-staging/endpoints"),
+                ],
             ),
         ]);
 
@@ -556,16 +571,20 @@ mod test {
         };
 
         let snapshot = new_snapshot([
-            (ResourceType::Listener, 123, vec!["default/nginx"]),
+            (ResourceType::Listener, vec![(121, "default/nginx")]),
             (
                 ResourceType::Cluster,
-                123,
-                vec!["default/nginx/cluster", "default/nginx-staging/cluster"],
+                vec![
+                    (123, "default/nginx/cluster"),
+                    (127, "default/nginx-staging/cluster"),
+                ],
             ),
             (
                 ResourceType::ClusterLoadAssignment,
-                123,
-                vec!["default/nginx/endpoints", "default/nginx-staging/endpoints"],
+                vec![
+                    (125, "default/nginx-staging/endpoints"),
+                    (124, "default/nginx/endpoints"),
+                ],
             ),
         ]);
 
@@ -604,23 +623,27 @@ mod test {
     }
 
     #[test]
-    fn test_handle_nack() {
+    fn test_lds_nack() {
         let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
         };
 
         let snapshot = new_snapshot([
-            (ResourceType::Listener, 123, vec!["default/nginx"]),
+            (ResourceType::Listener, vec![(121, "default/nginx")]),
             (
                 ResourceType::Cluster,
-                123,
-                vec!["default/nginx/cluster", "default/nginx-staging/cluster"],
+                vec![
+                    (123, "default/nginx/cluster"),
+                    (127, "default/nginx-staging/cluster"),
+                ],
             ),
             (
                 ResourceType::ClusterLoadAssignment,
-                123,
-                vec!["default/nginx/endpoints", "default/nginx-staging/endpoints"],
+                vec![
+                    (125, "default/nginx-staging/endpoints"),
+                    (124, "default/nginx/endpoints"),
+                ],
             ),
         ]);
 
@@ -659,29 +682,28 @@ mod test {
         );
     }
 
-    // TODO: what do we do about the case where a sub goes from r=[] (wildcard)
-    // to r=[a, b, c] if a subset of [a, b, c] is all that exists in the
-    // snapshot?  the client already has the current state of the world, but got
-    // there with a different subscription.
-
     #[test]
-    fn test_handle_ack_as_update_cds() {
+    fn test_cds_handle_ack_as_update() {
         let node = xds_core::Node {
             id: "test-node".to_string(),
             ..Default::default()
         };
 
         let snapshot = new_snapshot([
-            (ResourceType::Listener, 123, vec!["default/nginx"]),
+            (ResourceType::Listener, vec![(121, "default/nginx")]),
             (
                 ResourceType::Cluster,
-                123,
-                vec!["default/nginx/cluster", "default/nginx-staging/cluster"],
+                vec![
+                    (123, "default/nginx/cluster"),
+                    (127, "default/nginx-staging/cluster"),
+                ],
             ),
             (
                 ResourceType::ClusterLoadAssignment,
-                123,
-                vec!["default/nginx/endpoints", "default/nginx-staging/endpoints"],
+                vec![
+                    (125, "default/nginx-staging/endpoints"),
+                    (124, "default/nginx/endpionts"),
+                ],
             ),
         ]);
 
@@ -741,6 +763,70 @@ mod test {
     }
 
     #[test]
+    fn test_eds_ack() {
+        let node = xds_core::Node {
+            id: "test-node".to_string(),
+            ..Default::default()
+        };
+
+        let snapshot = new_snapshot([(
+            ResourceType::ClusterLoadAssignment,
+            vec![
+                (123, "default/nginx/endpoints"),
+                (124, "default/something-else/endpoints"),
+            ],
+        )]);
+
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(
+                ResourceType::ClusterLoadAssignment,
+                "",
+                "",
+                vec!["default/nginx/endpoints"],
+            ))
+            .unwrap();
+
+        // should return a single response for the resource in cache
+        assert_eq!(resp.len(), 1);
+        assert_eq!(
+            resp[0].type_url,
+            ResourceType::ClusterLoadAssignment.type_url(),
+            "should be an EDS resource",
+        );
+        assert_eq!(
+            resp[0].version_info,
+            snapshot
+                .version(ResourceType::ClusterLoadAssignment)
+                .unwrap()
+                .to_string(),
+        );
+        let next_version = &resp[0].version_info;
+        let next_nonce = &resp[0].nonce;
+
+        // when the client ACKs the first response, it shouldn't change the state of the connection
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(
+                ResourceType::ClusterLoadAssignment,
+                next_version,
+                next_nonce,
+                vec!["default/nginx/endpoints"],
+            ))
+            .unwrap();
+
+        assert!(resp.is_empty());
+
+        let sub = conn.subscriptions[ResourceType::ClusterLoadAssignment]
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            sub.last_sent_nonce,
+            Some(next_nonce.to_smolstr()),
+            "nonce should not change"
+        );
+    }
+
+    #[test]
     fn test_eds_update_remove_subscription() {
         let node = xds_core::Node {
             id: "test-node".to_string(),
@@ -748,16 +834,20 @@ mod test {
         };
 
         let snapshot = new_snapshot([
-            (ResourceType::Listener, 123, vec!["default/nginx"]),
+            (ResourceType::Listener, vec![(121, "default/nginx")]),
             (
                 ResourceType::Cluster,
-                123,
-                vec!["default/nginx/cluster", "default/nginx-staging/cluster"],
+                vec![
+                    (123, "default/nginx/cluster"),
+                    (127, "default/nginx-staging/cluster"),
+                ],
             ),
             (
                 ResourceType::ClusterLoadAssignment,
-                123,
-                vec!["default/nginx/endpoints", "default/nginx-staging/endpoints"],
+                vec![
+                    (125, "default/nginx-staging/endpoints"),
+                    (124, "default/nginx/endpionts"),
+                ],
             ),
         ]);
 
@@ -782,16 +872,16 @@ mod test {
             resp.iter().all(|msg| msg.resources.len() == 1),
             "should contain a single response",
         );
-        let last_version = &resp[0].version_info;
-        let last_nonce = &resp[0].nonce;
+        let last_version = &resp[1].version_info;
+        let last_nonce = &resp[1].nonce;
 
         // first ACK changes the subscriptions. shouldn't generate a response because
         // EDS doesn't require full sotw updates.
         let (_, resp) = conn
             .handle_ads_request(discovery_ack(
                 ResourceType::ClusterLoadAssignment,
-                &resp[1].version_info,
-                &resp[1].nonce,
+                last_version,
+                last_nonce,
                 vec!["default/nginx-staging/endpoints"],
             ))
             .unwrap();
@@ -809,13 +899,20 @@ mod test {
                     last_ack_nonce: Some(_),
                     applied: true,
                     ..
-                },
+                }
             ),
             "should track the ACK in the subscription: sub={sub:?}",
+        );
+        assert_eq!(
+            sub.last_sent_nonce,
+            Some(last_nonce.to_smolstr()),
+            "should still have the last nonce: sub={sub:#?}",
         );
 
         // second ACK shouldn't generate anything else, there's nothing to do
         // because the subscription hasn't changed.
+        //
+        // connection state shouldn't change
         let (_, resp) = conn
             .handle_ads_request(discovery_ack(
                 ResourceType::ClusterLoadAssignment,
@@ -825,6 +922,11 @@ mod test {
             ))
             .unwrap();
         assert!(resp.is_empty());
+
+        let sub = conn.subscriptions[ResourceType::ClusterLoadAssignment]
+            .as_ref()
+            .unwrap();
+        assert_eq!(sub.last_sent_nonce, Some(last_nonce.to_smolstr()));
     }
 
     #[test]
@@ -835,16 +937,20 @@ mod test {
         };
 
         let snapshot = new_snapshot([
-            (ResourceType::Listener, 123, vec!["default/nginx"]),
+            (ResourceType::Listener, vec![(121, "default/nginx")]),
             (
                 ResourceType::Cluster,
-                123,
-                vec!["default/nginx/cluster", "default/nginx-staging/cluster"],
+                vec![
+                    (123, "default/nginx/cluster"),
+                    (127, "default/nginx-staging/cluster"),
+                ],
             ),
             (
                 ResourceType::ClusterLoadAssignment,
-                123,
-                vec!["default/nginx/endpoints", "default/nginx-staging/endpoints"],
+                vec![
+                    (125, "default/nginx-staging/endpoints"),
+                    (124, "default/nginx/endpoints"),
+                ],
             ),
         ]);
 
@@ -889,8 +995,26 @@ mod test {
             .unwrap();
         assert!(resp.is_empty());
 
-        // should handle the next request. incremental means returning
-        // only the data for new names.
+        // accept the ACK and generate no respones. last_sent_nonce shouldn't change or anything.
+        let (_, resp) = conn
+            .handle_ads_request(discovery_ack(
+                ResourceType::ClusterLoadAssignment,
+                next_version,
+                next_nonce,
+                vec!["default/nginx/endpoints"],
+            ))
+            .unwrap();
+        assert!(resp.is_empty());
+        assert_eq!(
+            conn.subscriptions[ResourceType::ClusterLoadAssignment]
+                .as_ref()
+                .unwrap()
+                .last_sent_nonce,
+            Some(next_nonce.to_smolstr())
+        );
+
+        // should handle the next request as a subscription update. incremental
+        // means returning only the data for new names.
         let (_, resp) = conn
             .handle_ads_request(discovery_ack(
                 ResourceType::ClusterLoadAssignment,
@@ -911,25 +1035,133 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_eds_snapshot_update_during_ack() {
+        let node = xds_core::Node {
+            id: "test-node".to_string(),
+            ..Default::default()
+        };
+
+        let (snapshot, writer) = new_snapshot_with_writer(
+            ResourceType::ClusterLoadAssignment,
+            [
+                (ResourceType::Listener, vec![(123, "default/nginx")]),
+                (
+                    ResourceType::Cluster,
+                    vec![
+                        (123, "default/nginx/cluster"),
+                        (123, "default/nginx-staging/cluster"),
+                    ],
+                ),
+                (
+                    ResourceType::ClusterLoadAssignment,
+                    vec![(127, "default/nginx/endpoints")],
+                ),
+            ],
+        );
+
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(
+                ResourceType::ClusterLoadAssignment,
+                "",
+                "",
+                vec!["default/nginx/endpoints"],
+            ))
+            .unwrap();
+
+        // should return a single response for the resource in cache
+        assert_eq!(resp.len(), 1);
+        assert_eq!(
+            resp[0].type_url,
+            ResourceType::ClusterLoadAssignment.type_url(),
+            "should be an EDS resource",
+        );
+        let next_version = &resp[0].version_info;
+        let next_nonce = &resp[0].nonce;
+
+        // update the snapshot with a new endpoint
+        writer.update(
+            ResourceVersion::from_parts(0xBEEF, 124),
+            vec![(
+                "default/nginx-staging/endpoints".to_string(),
+                Some(anything()),
+            )]
+            .into_iter(),
+        );
+
+        // when the client ACKs the first response, it shouldn't change the state of the connection
+        let (_, resp) = conn
+            .handle_ads_request(discovery_request(
+                ResourceType::ClusterLoadAssignment,
+                next_version,
+                next_nonce,
+                vec!["default/nginx/endpoints"],
+            ))
+            .unwrap();
+
+        assert!(resp.is_empty());
+
+        let sub = conn.subscriptions[ResourceType::ClusterLoadAssignment]
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            sub.last_sent_nonce,
+            Some(next_nonce.to_smolstr()),
+            "nonce should not change"
+        );
+    }
+
     fn new_snapshot(
-        data: impl IntoIterator<Item = (ResourceType, u64, Vec<&'static str>)>,
+        data: impl IntoIterator<Item = (ResourceType, Vec<(u64, &'static str)>)>,
     ) -> Snapshot {
         let (snapshot, mut writers) = crate::xds::new_snapshot();
 
-        for (rtype, version, names) in data {
+        for (rtype, mut names) in data {
             let writer = writers
                 .for_type(rtype)
                 .expect("resource type specified twice");
 
-            writer.update(
-                ResourceVersion::from_raw_parts(0xBEEF, version),
-                names
-                    .into_iter()
-                    .map(|name| (name.to_string(), Some(anything()))),
-            );
+            // sort the fake data so that the latest update happens last
+            names.sort_by_key(|(v, _)| *v);
+            for (version, name) in names {
+                writer.update(
+                    ResourceVersion::from_parts(0xBEEF, version),
+                    std::iter::once((name.to_string(), Some(anything()))),
+                );
+            }
         }
 
         snapshot
+    }
+
+    fn new_snapshot_with_writer(
+        writer_type: ResourceType,
+        data: impl IntoIterator<Item = (ResourceType, Vec<(u64, &'static str)>)>,
+    ) -> (Snapshot, SnapshotWriter) {
+        let (snapshot, mut writers) = crate::xds::new_snapshot();
+        let mut return_writer = None;
+
+        for (rtype, mut names) in data {
+            let writer = writers
+                .for_type(rtype)
+                .expect("resource type specified twice");
+
+            // sort the fake data so that the latest update happens last
+            names.sort_by_key(|(v, _)| *v);
+            for (version, name) in names {
+                writer.update(
+                    ResourceVersion::from_parts(0xBEEF, version),
+                    std::iter::once((name.to_string(), Some(anything()))),
+                );
+            }
+
+            if rtype == writer_type {
+                return_writer = Some(writer);
+            }
+        }
+
+        (snapshot, return_writer.unwrap())
     }
 
     fn discovery_request(
