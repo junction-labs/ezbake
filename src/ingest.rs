@@ -591,25 +591,35 @@ fn build_cluster(svc: &Service) -> Option<xds_cluster::Cluster> {
     let (namespace, name) =
         namespace_and_name(svc).expect("build_cluster: service missing namespace and name");
 
-    let (lb_policy, lb_config) = lb_config_from(svc.annotations())?;
-
-    Some(xds_cluster::Cluster {
-        name: cluster_name(namespace, name),
-        lb_policy: lb_policy.into(),
-        lb_config: Some(lb_config),
-        cluster_discovery_type: Some(ClusterDiscoveryType::Type(DiscoveryType::Eds.into())),
-        eds_cluster_config: Some(EdsClusterConfig {
-            eds_config: Some(ads_config_source()),
-            service_name: cla_name(namespace, name),
-        }),
-        ..Default::default()
-    })
+    if let Some((lb_policy, lb_config)) = lb_config_from(svc.annotations()) {
+        Some(xds_cluster::Cluster {
+            name: cluster_name(namespace, name),
+            lb_policy: lb_policy.into(),
+            lb_config: Some(lb_config),
+            cluster_discovery_type: Some(ClusterDiscoveryType::Type(DiscoveryType::Eds.into())),
+            eds_cluster_config: Some(EdsClusterConfig {
+                eds_config: Some(ads_config_source()),
+                service_name: cla_name(namespace, name),
+            }),
+            ..Default::default()
+        })
+    } else {
+        Some(xds_cluster::Cluster {
+            name: cluster_name(namespace, name),
+            cluster_discovery_type: Some(ClusterDiscoveryType::Type(DiscoveryType::Eds.into())),
+            eds_cluster_config: Some(EdsClusterConfig {
+                eds_config: Some(ads_config_source()),
+                service_name: cla_name(namespace, name),
+            }),
+            ..Default::default()
+        })
+    }
 }
 
 /// parse an LbConfig from annotations.
 ///
-/// returns `None` if there was a problem parsing or an unsupported policy was
-/// specified, but defaults to RoundRobin if no policy was specified.
+/// returns `None` if there was a problem parsing, no policy was specified,
+/// or an unsupported policy was specified
 fn lb_config_from(
     annotations: &BTreeMap<String, String>,
 ) -> Option<(
@@ -625,7 +635,7 @@ fn lb_config_from(
         .get("junctionlabs.io/lb-strategy")
         .map(|s| LbPolicy::from_str_name(s))
     {
-        None | Some(Some(LbPolicy::RoundRobin)) => Some((
+        Some(Some(LbPolicy::RoundRobin)) => Some((
             LbPolicy::RoundRobin,
             LbConfig::RoundRobinLbConfig(Default::default()),
         )),

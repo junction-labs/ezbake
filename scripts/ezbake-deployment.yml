@@ -1,0 +1,28 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ezbake
+  namespace: junction
+  labels:
+    app: ezbake
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ezbake
+  template:
+    metadata:
+      labels:
+        app: ezbake
+    spec:
+      serviceAccountName: junction-account
+      containers:
+        - name: ezbake
+          command: ["./ezbake"]
+          args: ["--all-namespaces"]
+          image: ezbake:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: "ezbake=trace,warn"
