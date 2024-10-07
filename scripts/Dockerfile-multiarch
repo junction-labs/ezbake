@@ -103,6 +103,7 @@ RUN set -ex; \
 
 # # Create a single layer image
 FROM scratch AS runtime
+LABEL org.opencontainers.image.source="https://github.com/junction-labs/ezbake"
 ARG TARGETPLATFORM
 ARG TARGETARCH
 WORKDIR /app
