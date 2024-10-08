@@ -34,5 +34,8 @@ jobs:
   
       - name: 'Build Image'
         run: |
-          docker build --file ./scripts/Dockerfile-multiarch --tag ${{env.REGISTRY}}/junction-labs/${{env.IMAGE_NAME}}:latest .
-          docker push ${{env.REGISTRY}}/junction-labs/${{env.IMAGE_NAME}}:latest
+          docker build --file ./scripts/Dockerfile-multiarch  \
+                       --platform=linux/arm64,linux/amd64 \
+                       --push \
+                       --tag ${{env.REGISTRY}}/junction-labs/${{env.IMAGE_NAME}}:latest \
+                       .

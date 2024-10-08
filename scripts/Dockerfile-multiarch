@@ -4,7 +4,9 @@ FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-latest AS c
 WORKDIR /app
 
 FROM chef AS planner
-COPY . .
+COPY ./Cargo.lock ./Cargo.lock
+COPY ./Cargo.toml ./Cargo.toml
+COPY ./src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder 

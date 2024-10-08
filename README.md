@@ -146,22 +146,6 @@ to look for your server on that address.
 
 ## Advanced
 
-### Multiarch Docker builds
-
-To create a x86 and ARM64 multiarch build container that comes with the cost of
-a slower build, you will need to do a one off installation of buildx:
-
-```bash
-docker buildx create --name mybuilder2 --use
-docker buildx install
-```
-
-Then:
-
-```bash
-docker build --tag ezbake --file ./scripts/Dockerfile-multiarch --load .
-```
-
 ### Deploying to Kubernetes in a Single Namespace
 
 On a cluster where you only have access to a single namespace, you can still run
