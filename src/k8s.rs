@@ -1,11 +1,10 @@
 use futures::TryStreamExt;
-use gateway_api::apis::standard::httproutes::HTTPRoute;
+use gateway_api::apis::experimental::httproutes::HTTPRoute;
 use k8s_openapi::{
     api::{core::v1::Service, discovery::v1::EndpointSlice},
     serde::Deserialize,
 };
 use kube::{
-    api::ObjectMeta,
     runtime::{
         self,
         reflector::{self, store::Writer, ObjectRef, Store},
@@ -302,15 +301,6 @@ async fn sleep_until(deadline: &Option<Instant>) {
         Some(d) => tokio::time::sleep_until((*d).into()).await,
         None => futures::future::pending().await,
     }
-}
-
-pub(crate) fn namespace_and_name<T: k8s_openapi::Metadata<Ty = ObjectMeta>>(
-    t: &T,
-) -> Option<(&str, &str)> {
-    let meta = t.metadata();
-    let namespace = meta.namespace.as_ref()?;
-    let name = meta.name.as_ref()?;
-    Some((namespace, name))
 }
 
 pub(crate) fn ref_namespace_and_name<T: KubeResource>(
