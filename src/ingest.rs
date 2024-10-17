@@ -3,18 +3,17 @@ use std::{
     sync::Arc,
 };
 
-use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HTTPRouteRules, HTTPRouteRulesBackendRefs, HTTPRouteRulesMatches,
-    HTTPRouteRulesMatchesHeaders, HTTPRouteRulesMatchesHeadersType,
+use gateway_api::apis::experimental::httproutes::HTTPRoute;
+use junction_api::{
+    backend::Backend,
+    http::Route,
+    shared::{ServiceTarget, Target},
 };
 use k8s_openapi::api::{
     core::v1::Service,
     discovery::v1::{Endpoint, EndpointSlice},
 };
-use kube::{
-    runtime::reflector::{ObjectRef, Store},
-    Resource, ResourceExt,
-};
+use kube::runtime::reflector::{ObjectRef, Store};
 
 use tokio::sync::broadcast;
 use tracing::{debug, info, trace};
@@ -36,16 +35,41 @@ use xds_api::pb::{
 };
 
 use crate::{
-    k8s::{
-        namespace_and_name, ref_namespace_and_name, ChangedObjects, KubeResource, RefAndParents,
-        Watch,
-    },
+    k8s::{ref_namespace_and_name, ChangedObjects, KubeResource, RefAndParents, Watch},
     xds::{SnapshotWriter, VersionCounter},
 };
 
-// FIXME: what do we do about errors in conversion? just log? the current situation is truly terrible
-// FIXME: Listeners, Clusters, and Endpoints should all be async fn (...) -> Result<(), Error> instead of objects that get immediately new()'d then run()'d.
+/// shorthand for protobuf::Any::from_msg(..).expect(...) with a standard message
+///
+/// this isn't a fn so we don't have to depend on Prost
+macro_rules! into_any {
+    ($msg:expr) => {
+        protobuf::Any::from_msg(&$msg).expect("failed to serialize protobuf::Any. this is a bug")
+    };
+}
+
+// FIXME: what do we do about errors in conversion? right now we just delete any
+// existing config while logging. that's not the best.
+
+// FIXME: Listeners, Clusters, and Endpoints should all be async fn (...) ->
+// Result<(), Error> instead of objects that get immediately new()'d then
+// run()'d.
+
 // FIXME: tests????
+
+/// An error converting resources or getting bad k8s input.
+#[derive(Debug, thiserror::Error)]
+enum IngestError {
+    #[error("invalid object: {0}")]
+    InvalidObject(String),
+
+    #[error("failed to convert: {0}")]
+    InvalidConfig(#[from] junction_api::Error),
+}
+
+fn missing_metadata_error() -> IngestError {
+    IngestError::InvalidObject("missing namespace and name".to_string())
+}
 
 /// `Listeners`` listens for changes to either `HTTPRoute`s or `Service`s in
 /// kube and converts them into XDS Listener resources. All Listeners and
@@ -93,9 +117,15 @@ impl Listeners {
                     // time the rest of the select block
                     let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "Listener", "kube_kind" => "Service");
 
-                    let updates = objs.iter().map(|obj_ref| self.service_changed(&obj_ref.obj));
+                    let mut updates = vec![];
+                    for obj_ref in &*objs {
+                        match self.service_changed(&obj_ref.obj) {
+                            Ok(update) => updates.extend(update),
+                            Err(e) => info!(route = %obj_ref.obj, err = %e, "updating Listener failed"),
+                        }
+                    }
                     let version = self.version_counter.next();
-                    self.writer.update(version, updates);
+                    self.writer.update(version, updates.into_iter());
                     debug!(%version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
                 },
                 routes = self.routes_changed.recv() => {
@@ -107,70 +137,116 @@ impl Listeners {
                     // time the rest of the select block
                     let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "Listener", "kube_kind" => "HTTPRoute");
 
-                    let updates = objs.iter().flat_map(|obj_ref| self.route_changed(obj_ref));
+                    let mut updates = vec![];
+                    for obj_ref in &*objs {
+                        match self.route_changed(obj_ref) {
+                            Ok(update) => updates.push(update),
+                            Err(e) => info!(route = %obj_ref.obj, err = %e, "updating Listener failed"),
+                        }
+                    }
                     let version = self.version_counter.next();
-                    self.writer.update(version, updates);
+                    self.writer.update(version, updates.into_iter());
                     debug!(%version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
                 },
             }
         }
     }
 
-    fn service_changed(&self, svc_ref: &ObjectRef<Service>) -> (String, Option<protobuf::Any>) {
-        let (namespace, name) = ref_namespace_and_name(svc_ref).unwrap();
+    // On service change, unconditionally re-create the default Listener for
+    // this service to pass load balancer info over xDS.
+    //
+    // If there's no Listener registered with the same name and namespace, also
+    // create an empty route pointing at this Service to poulate the DNS name.
+    fn service_changed(
+        &self,
+        svc_ref: &ObjectRef<Service>,
+    ) -> Result<Vec<(String, Option<protobuf::Any>)>, IngestError> {
+        let (namespace, name) =
+            ref_namespace_and_name(svc_ref).ok_or_else(missing_metadata_error)?;
         let listener_name = listener_name(namespace, name);
 
         trace!(svc = %svc_ref, listener = %listener_name, "building Listener: Service changed");
 
-        let proto = self.svc_and_route(svc_ref).map(|(svc, route)| {
-            let listener = build_listener(&svc, route.as_deref());
-            protobuf::Any::from_msg(&listener).expect("constructed invalid Listener")
-        });
-
-        (listener_name, proto)
-    }
-
-    fn route_changed(
-        &self,
-        route_ref: &RefAndParents<HTTPRoute>,
-    ) -> Vec<(String, Option<protobuf::Any>)> {
-        let route = self.routes.get(&route_ref.obj);
-        let svcs = route_ref
-            .parents
-            .iter()
-            .filter_map(|svc_ref| self.services.get(svc_ref));
+        let backends = self
+            .services
+            .get(svc_ref)
+            .map(|s| Backend::from_service(&s))
+            .transpose()?;
 
         let mut updates = vec![];
-        for svc in svcs {
-            let (namespace, name) = namespace_and_name(svc.as_ref()).unwrap();
-            let listener_name = listener_name(namespace, name);
-            trace!(namespace, name, listener = %listener_name, "building Listener: HTTPRoute changed");
-            let listener = protobuf::Any::from_msg(&build_listener(&svc, route.as_deref()))
-                .expect("constructed invalid Listener");
+        // create/destroy the default Listener for every backend
+        match &backends {
+            Some(backends) => {
+                // FIXME: with mulitple ports, these will clobber
+                let default_listeners = backends.iter().map(|b| {
+                    let listener = default_listener(&b.target, b.to_xds_default_vhost());
 
-            updates.push((listener_name, Some(listener)))
+                    (
+                        default_listener_name(namespace, name),
+                        Some(into_any!(listener)),
+                    )
+                });
+                updates.extend(default_listeners);
+            }
+            None => updates.push((default_listener_name(namespace, name), None)),
         }
 
-        updates
-    }
-
-    fn svc_and_route(
-        &self,
-        svc_ref: &ObjectRef<Service>,
-    ) -> Option<(Arc<Service>, Option<Arc<HTTPRoute>>)> {
-        let svc = self.services.get(svc_ref)?;
-
-        let mut route = None;
-
-        for r in self.routes.state() {
-            if r.parent_refs().contains(svc_ref) && route.replace(r).is_some() {
-                info!(svc = %svc_ref, "found multiple HTTPRoutes attached to the same Service. skipping.");
-                return None;
+        // if there's no corresponding route, generate a passthrough route
+        if let Some(backends) = &backends {
+            for backend in backends {
+                // FIXME: this will clobber with multiple ports. replace it with the target-name
+                let route_ref = ObjectRef::new(name).within(namespace);
+                if self.routes.get(&route_ref).is_none() {
+                    let route = Route::passthrough_route(backend.target.clone());
+                    let listener = into_any!(api_listener(route.to_xds()));
+                    updates.push((listener_name.clone(), Some(listener)));
+                }
             }
         }
 
-        Some((svc, route))
+        Ok(updates)
     }
+
+    // On HTTPRoute change, convert directly to Junction routes and listeners.
+    fn route_changed(
+        &self,
+        route_ref: &RefAndParents<HTTPRoute>,
+    ) -> Result<(String, Option<protobuf::Any>), IngestError> {
+        let (namespace, name) =
+            ref_namespace_and_name(&route_ref.obj).ok_or_else(missing_metadata_error)?;
+        let listener_name = listener_name(namespace, name);
+
+        trace!(route = %route_ref.obj, listener = %listener_name, "building Listener: HTTPRoute changed");
+
+        let route = self.routes.get(&route_ref.obj);
+        let listener = route
+            .map(|route| Route::from_gateway_httproute(&route.spec))
+            .transpose()?
+            .map(|route| {
+                let listener = api_listener(route.to_xds());
+                into_any!(listener)
+            });
+
+        Ok((listener_name, listener))
+    }
+
+    // fn svc_and_route(
+    //     &self,
+    //     svc_ref: &ObjectRef<Service>,
+    // ) -> Option<(Arc<Service>, Option<Arc<HTTPRoute>>)> {
+    //     let svc = self.services.get(svc_ref)?;
+
+    //     let mut route = None;
+
+    //     for r in self.routes.state() {
+    //         if r.parent_refs().contains(svc_ref) && route.replace(r).is_some() {
+    //             info!(svc = %svc_ref, "found multiple HTTPRoutes attached to the same Service. skipping.");
+    //             return None;
+    //         }
+    //     }
+
+    //     Some((svc, route))
+    // }
 }
 
 /// `Clusters` listens for changes to Services in Kubernetes and generates XDS Cluster
@@ -202,34 +278,42 @@ impl Clusters {
             // time each iteration of the loop
             let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "Cluster", "kube_kind" => "Service");
 
-            let updates = services
-                .iter()
-                .map(|svc_ref| self.service_changed(&svc_ref.obj));
+            let mut updates = vec![];
+            for svc_ref in &*services {
+                match self.service_changed(&svc_ref.obj) {
+                    Ok(clusters) => updates.extend(clusters),
+                    Err(e) => info!(svc = %svc_ref.obj, err = %e, "updating Cluster failed"),
+                }
+            }
             let version = self.version_counter.next();
-            self.writer.update(version, updates);
+            self.writer.update(version, updates.into_iter());
             debug!(%version, changed = services.len(), resource_type = ?crate::xds::ResourceType::Cluster, "updated snapshot");
         }
     }
 
-    fn service_changed(&self, svc_ref: &ObjectRef<Service>) -> (String, Option<protobuf::Any>) {
+    // On every Service change, create/delete a Cluster for every port defined
+    // on this service.
+    fn service_changed(
+        &self,
+        svc_ref: &ObjectRef<Service>,
+    ) -> Result<Vec<(String, Option<protobuf::Any>)>, IngestError> {
         let (namespace, name) = ref_namespace_and_name(svc_ref).unwrap();
         let cluster_name = cluster_name(namespace, name);
 
         trace!(svc = %svc_ref, cluster = %cluster_name, "building Cluster");
 
-        let proto = match self.services.get(svc_ref).map(|s| build_cluster(&s)) {
-            Some(Some(cluster)) => Some(
-                protobuf::Any::from_msg(&cluster)
-                    .expect("invalid Cluster config: check svc annotations"),
-            ),
-            Some(None) => {
-                info!(svc = %svc_ref, "invalid Cluster config");
-                None
-            }
-            None => None,
+        let clusters = self.services.get(svc_ref).map(|s| build_clusters(&s));
+        let updates = match clusters {
+            Some(clusters) => clusters?
+                .into_iter()
+                .map(|c| (c.name.clone(), Some(into_any!(c))))
+                .collect(),
+            // FIXME: this will leak clusters with multiple ports. have to keep
+            // an index with the mapping of svc to ports.
+            None => vec![(cluster_name, None)],
         };
 
-        (cluster_name, proto)
+        Ok(updates)
     }
 }
 
@@ -316,57 +400,52 @@ impl LoadAssignments {
 
         trace!(svc = %svc_ref, cla = %name, "building ClusterLoadAssignment");
 
-        (
-            name,
-            Some(protobuf::Any::from_msg(&proto).expect("built invalid ClusterLoadAssignment")),
-        )
+        (name, Some(into_any!(proto)))
     }
 }
 
 /// Generate a well-known `name.namespace.svc.cluster.local` name for a service.
 ///
 fn listener_name(namespace: &str, name: &str) -> String {
-    format!("{name}.{namespace}.svc.cluster.local")
+    let target = Target::Service(ServiceTarget {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        port: None,
+    });
+    target.xds_listener_name()
 }
 
-fn route_config_name(namespace: &str, name: &str) -> String {
-    format!("{namespace}/{name}/routes")
+fn default_listener_name(namespace: &str, name: &str) -> String {
+    let target = Target::Service(ServiceTarget {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        port: None,
+    });
+    target.xds_default_listener_name()
 }
 
 fn cluster_name(namespace: &str, name: &str) -> String {
-    format!("{namespace}/{name}/cluster")
+    let target = Target::Service(ServiceTarget {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        port: None,
+    });
+    target.xds_cluster_name()
 }
 
 fn cla_name(namespace: &str, name: &str) -> String {
     format!("{namespace}/{name}/endpoints")
 }
 
-fn ads_config_source() -> xds_core::ConfigSource {
-    xds_core::ConfigSource {
-        config_source_specifier: Some(xds_core::config_source::ConfigSourceSpecifier::Ads(
-            xds_core::AggregatedConfigSource {},
-        )),
-        resource_api_version: xds_core::ApiVersion::V3 as i32,
-        ..Default::default()
-    }
-}
-
-fn build_listener(service: &Service, http_route: Option<&HTTPRoute>) -> xds_listener::Listener {
+/// Wrap a Listener with an api_listener around a RouteConfiguration and serve it
+/// as part of LDS.
+fn api_listener(route: xds_route::RouteConfiguration) -> xds_listener::Listener {
     use xds_http::http_connection_manager::RouteSpecifier;
     use xds_http::http_filter::ConfigType;
 
-    let (namespace, name) = namespace_and_name(service).expect("service missing namespace/name");
-
-    let hash_policy = annotation_hash_policies(service);
-    let virtual_host: xds_route::VirtualHost = http_route
-        .and_then(|r| to_xds_vhost(r, &hash_policy))
-        .unwrap_or_else(|| default_vhost(cluster_name(namespace, name), hash_policy));
-
-    let route_specifier = Some(RouteSpecifier::RouteConfig(xds_route::RouteConfiguration {
-        name: route_config_name(namespace, name),
-        virtual_hosts: vec![virtual_host],
-        ..Default::default()
-    }));
+    // TODO: figure out the actual name for this route
+    let name = route.name.clone();
+    let route_specifier = Some(RouteSpecifier::RouteConfig(route));
 
     let http_router_filter = xds_http_filter::Router::default();
     let conn_manager = xds_http::HttpConnectionManager {
@@ -381,285 +460,31 @@ fn build_listener(service: &Service, http_route: Option<&HTTPRoute>) -> xds_list
         ..Default::default()
     };
 
-    let api_listener = Some(
-        protobuf::Any::from_msg(&conn_manager).expect("generated invald HttpConnectionManager"),
-    );
-    xds_listener::Listener {
-        name: listener_name(
-            service.namespace().as_ref().unwrap(),
-            service.meta().name.as_ref().unwrap(),
+    let api_listener = Some(xds_listener::ApiListener {
+        api_listener: Some(
+            protobuf::Any::from_msg(&conn_manager).expect("generated invald HttpConnectionManager"),
         ),
-        api_listener: Some(xds_listener::ApiListener { api_listener }),
-        ..Default::default()
-    }
-}
-
-// FIXME: convert matchers other than headers.
-//
-// - method: envoy uses the :method http/2 header to match on method. see: https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/route/v3/route_components.proto#envoy-v3-api-msg-config-route-v3-headermatcher
-// - query: tthere'
-fn to_xds_vhost(
-    http_route: &HTTPRoute,
-    hash_policy: &[xds_route::route_action::HashPolicy],
-) -> Option<xds_route::VirtualHost> {
-    let route_namespace = http_route.metadata.namespace.as_ref()?;
-    let http_route_rules = http_route.spec.rules.iter().flatten();
-    let routes: Vec<_> = http_route_rules
-        .flat_map(|r| to_xds_route(route_namespace, r, hash_policy))
-        .collect();
-
-    Some(xds_route::VirtualHost {
-        domains: vec!["*".to_string()],
-        routes,
-        ..Default::default()
-    })
-}
-
-fn to_xds_route(
-    route_namespace: &str,
-    rule: &HTTPRouteRules,
-    hash_policy: &[xds_route::route_action::HashPolicy],
-) -> Vec<xds_route::Route> {
-    use xds_route::route::Action;
-
-    let backend_refs = rule.backend_refs.as_deref().unwrap_or_default();
-    let Some(cluster_spec) = to_xds_cluster_specifier(route_namespace, backend_refs) else {
-        return Vec::new();
-    };
-
-    let matches = rule.matches.iter().flatten().filter_map(to_xds_route_match);
-    matches
-        .map(|m| xds_route::Route {
-            r#match: Some(m),
-            action: Some(Action::Route(xds_route::RouteAction {
-                hash_policy: hash_policy.to_vec(),
-                cluster_specifier: Some(cluster_spec.clone()),
-                ..Default::default()
-            })),
-            ..Default::default()
-        })
-        .collect()
-}
-
-fn to_xds_cluster_specifier(
-    route_namespace: &str,
-    backend_refs: &[HTTPRouteRulesBackendRefs],
-) -> Option<xds_route::route_action::ClusterSpecifier> {
-    use xds_route::route_action::ClusterSpecifier;
-    use xds_route::weighted_cluster::ClusterWeight;
-    use xds_route::WeightedCluster;
-
-    match &backend_refs {
-        &[] => None,
-        &[svc_ref] => {
-            let cluster_name = cluster_name(
-                svc_ref.namespace.as_deref().unwrap_or(route_namespace),
-                &svc_ref.name,
-            );
-            Some(ClusterSpecifier::Cluster(cluster_name))
-        }
-        backend_refs => {
-            let clusters = backend_refs
-                .iter()
-                .map(|svc_ref| {
-                    let name = cluster_name(
-                        svc_ref.namespace.as_deref().unwrap_or(route_namespace),
-                        &svc_ref.name,
-                    );
-                    let weight = svc_ref.weight.unwrap_or_default() as u32;
-                    ClusterWeight {
-                        name,
-                        weight: Some(weight.into()),
-                        ..Default::default()
-                    }
-                })
-                .collect();
-
-            Some(ClusterSpecifier::WeightedClusters(WeightedCluster {
-                clusters,
-                ..Default::default()
-            }))
-        }
-    }
-}
-
-fn to_xds_route_match(h: &HTTPRouteRulesMatches) -> Option<xds_route::RouteMatch> {
-    use gateway_api::apis::standard::httproutes::HTTPRouteRulesMatchesPathType;
-    use xds_route::route_match::PathSpecifier;
-
-    let headers = h
-        .headers
-        .iter()
-        .flatten()
-        .filter_map(convert_header_match)
-        .collect();
-
-    let path_spec = h
-        .path
-        .as_ref()
-        .and_then(|p| p.r#type.as_ref().zip(p.value.as_ref()))
-        .and_then(|(p_type, value)| match p_type {
-            HTTPRouteRulesMatchesPathType::Exact => Some(PathSpecifier::Path(value.clone())),
-            HTTPRouteRulesMatchesPathType::PathPrefix => Some(PathSpecifier::Prefix(value.clone())),
-            _ => None,
-        });
-
-    Some(xds_route::RouteMatch {
-        headers,
-        path_specifier: path_spec,
-        ..Default::default()
-    })
-}
-
-fn convert_header_match(h: &HTTPRouteRulesMatchesHeaders) -> Option<xds_route::HeaderMatcher> {
-    use xds_route::header_matcher::HeaderMatchSpecifier;
-    use HTTPRouteRulesMatchesHeadersType::*;
-
-    let match_spec = match h.r#type {
-        Some(Exact) => HeaderMatchSpecifier::ExactMatch(h.value.clone()),
-        None => HeaderMatchSpecifier::PresentMatch(true),
-        _ => return None,
-    };
-
-    Some(xds_route::HeaderMatcher {
-        name: h.name.clone(),
-        header_match_specifier: Some(match_spec),
-        ..Default::default()
-    })
-}
-
-fn annotation_hash_policies(svc: &Service) -> Vec<xds_route::route_action::HashPolicy> {
-    use xds_route::route_action::hash_policy::Header;
-    use xds_route::route_action::hash_policy::PolicySpecifier;
-    use xds_route::route_action::HashPolicy;
-
-    let mut policies = Vec::new();
-
-    if let Some(header_names) = svc.annotations().get("junctionlabs.io/hash-header") {
-        let cleaned_names = header_names.split(',').map(|s| s.trim().to_string());
-
-        let header_policies = cleaned_names.map(|name| HashPolicy {
-            terminal: false,
-            policy_specifier: Some(PolicySpecifier::Header(Header {
-                header_name: name,
-                regex_rewrite: None,
-            })),
-        });
-
-        policies.extend(header_policies);
-    }
-
-    policies
-}
-
-fn default_vhost(
-    cluster: String,
-    hash_policy: Vec<xds_route::route_action::HashPolicy>,
-) -> xds_route::VirtualHost {
-    use xds_route::route::Action;
-    use xds_route::route_action::ClusterSpecifier;
-    use xds_route::route_match::PathSpecifier;
-
-    let path_specifier = PathSpecifier::Prefix(String::new());
-    let action = Action::Route(xds_route::RouteAction {
-        cluster_specifier: Some(ClusterSpecifier::Cluster(cluster)),
-        hash_policy,
-        ..Default::default()
     });
 
-    let default_route = xds_route::Route {
-        r#match: Some(xds_route::RouteMatch {
-            path_specifier: Some(path_specifier),
-            ..Default::default()
-        }),
-        action: Some(action),
-        ..Default::default()
-    };
-
-    xds_route::VirtualHost {
-        domains: vec!["*".to_string()],
-        routes: vec![default_route],
+    xds_listener::Listener {
+        name,
+        api_listener,
         ..Default::default()
     }
 }
 
-fn build_cluster(svc: &Service) -> Option<xds_cluster::Cluster> {
-    use xds_cluster::cluster::ClusterDiscoveryType;
-    use xds_cluster::cluster::DiscoveryType;
-    use xds_cluster::cluster::EdsClusterConfig;
-
-    let (namespace, name) =
-        namespace_and_name(svc).expect("build_cluster: service missing namespace and name");
-
-    if let Some((lb_policy, lb_config)) = lb_config_from(svc.annotations()) {
-        Some(xds_cluster::Cluster {
-            name: cluster_name(namespace, name),
-            lb_policy: lb_policy.into(),
-            lb_config: Some(lb_config),
-            cluster_discovery_type: Some(ClusterDiscoveryType::Type(DiscoveryType::Eds.into())),
-            eds_cluster_config: Some(EdsClusterConfig {
-                eds_config: Some(ads_config_source()),
-                service_name: cla_name(namespace, name),
-            }),
-            ..Default::default()
-        })
-    } else {
-        Some(xds_cluster::Cluster {
-            name: cluster_name(namespace, name),
-            cluster_discovery_type: Some(ClusterDiscoveryType::Type(DiscoveryType::Eds.into())),
-            eds_cluster_config: Some(EdsClusterConfig {
-                eds_config: Some(ads_config_source()),
-                service_name: cla_name(namespace, name),
-            }),
-            ..Default::default()
-        })
-    }
+fn default_listener(target: &Target, vhost: xds_route::VirtualHost) -> xds_listener::Listener {
+    let name = target.xds_default_listener_name();
+    api_listener(xds_route::RouteConfiguration {
+        name,
+        virtual_hosts: vec![vhost],
+        ..Default::default()
+    })
 }
 
-/// parse an LbConfig from annotations.
-///
-/// returns `None` if there was a problem parsing, no policy was specified,
-/// or an unsupported policy was specified
-fn lb_config_from(
-    annotations: &BTreeMap<String, String>,
-) -> Option<(
-    xds_cluster::cluster::LbPolicy,
-    xds_cluster::cluster::LbConfig,
-)> {
-    use xds_cluster::cluster::ring_hash_lb_config::HashFunction;
-    use xds_cluster::cluster::LbConfig;
-    use xds_cluster::cluster::LbPolicy;
-    use xds_cluster::cluster::RingHashLbConfig;
-
-    match annotations
-        .get("junctionlabs.io/lb-strategy")
-        .map(|s| LbPolicy::from_str_name(s))
-    {
-        Some(Some(LbPolicy::RoundRobin)) => Some((
-            LbPolicy::RoundRobin,
-            LbConfig::RoundRobinLbConfig(Default::default()),
-        )),
-        Some(Some(LbPolicy::RingHash)) => {
-            let min_size: u64 = annotations
-                .get("junctionlabs.io/ring-hash-min-size")
-                .and_then(|x| x.parse().ok())
-                .unwrap_or(128);
-            let max_size: u64 = annotations
-                .get("junctionlabs.io/ring-hash-max-size")
-                .and_then(|x| x.parse().ok())
-                .unwrap_or(1024);
-
-            Some((
-                LbPolicy::RingHash,
-                LbConfig::RingHashLbConfig(RingHashLbConfig {
-                    minimum_ring_size: Some(min_size.into()),
-                    maximum_ring_size: Some(max_size.into()),
-                    hash_function: HashFunction::XxHash.into(),
-                }),
-            ))
-        }
-        _ => None,
-    }
+fn build_clusters(svc: &Service) -> Result<Vec<xds_cluster::Cluster>, IngestError> {
+    let backends = Backend::from_service(svc)?;
+    Ok(backends.into_iter().map(|b| b.to_xds_cluster()).collect())
 }
 
 fn build_cla<'a>(
