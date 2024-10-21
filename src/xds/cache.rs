@@ -146,11 +146,6 @@ pub(crate) struct Snapshot {
     inner: Arc<SnapshotInner>,
 }
 
-pub(crate) struct SnapshotWriter {
-    resource_type: ResourceType,
-    inner: Arc<SnapshotInner>,
-}
-
 pub(crate) fn new_snapshot() -> (Snapshot, TypedWriters) {
     let inner = Arc::new(SnapshotInner::default());
     (
@@ -198,6 +193,12 @@ impl Snapshot {
         self.inner.typed[resource_type].resources.get(resource_name)
     }
 
+    pub fn contains(&self, resource_type: ResourceType, resource_name: &str) -> bool {
+        self.inner.typed[resource_type]
+            .resources
+            .contains_key(resource_name)
+    }
+
     pub fn len(&self, resource_type: ResourceType) -> usize {
         self.inner.typed[resource_type].resources.len()
     }
@@ -210,7 +211,18 @@ impl Snapshot {
     }
 }
 
+pub(crate) struct SnapshotWriter {
+    resource_type: ResourceType,
+    inner: Arc<SnapshotInner>,
+}
+
 impl SnapshotWriter {
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            inner: self.inner.clone(),
+        }
+    }
+
     pub fn update(
         &self,
         version: ResourceVersion,
