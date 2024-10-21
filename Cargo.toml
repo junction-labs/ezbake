@@ -32,7 +32,7 @@ tower = "0.4"
 tower-http = { version = "0.4", features = ["metrics", "trace"] }
 xds-api = { version = "0.1", features = ["descriptor"] }
 
-junction-api = { git = "https://github.com/junction-labs/junction-client", features = [
+junction-api = { git = "https://github.com/junction-labs/junction-client", branch = "benl/name", features = [
     "kube",
     "xds",
 ] }

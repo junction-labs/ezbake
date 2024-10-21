@@ -302,12 +302,3 @@ async fn sleep_until(deadline: &Option<Instant>) {
         None => futures::future::pending().await,
     }
 }
-
-pub(crate) fn ref_namespace_and_name<T: KubeResource>(
-    obj_ref: &ObjectRef<T>,
-) -> Option<(&str, &str)> {
-    let namespace = obj_ref.namespace.as_ref()?;
-    let name = &obj_ref.name;
-
-    Some((namespace, name))
-}
