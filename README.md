@@ -99,7 +99,7 @@ namespace named `junction`, a `ServiceAccount` with permissions to watch the
 whole cluster, and an `ezbake` Deployment.
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/experimental-install.yaml
 kubectl apply -f ./scripts/install-for-cluster.yml
 ```
 
@@ -119,7 +119,7 @@ To uninstall, run `kubectl delete` on the Gateway APIs and the Junction example 
 
 ```bash
 kubectl delete -f ./scripts/install-for-cluster.yml
-kubectl delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+kubectl delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/experimental-install.yaml
 ```
 
 To install `ezbake` on a k8s cluster where you do not have full k8s administrative access, see the
@@ -158,7 +158,7 @@ section.
 Have your cluster admin install the Gateway APIs by [following the official instructions][official-instructions].
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/experimental-install.yaml
 ```
 
 [official-instructions]: https://gateway-api.sigs.k8s.io/guides/#installing-gateway-api
