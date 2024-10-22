@@ -602,7 +602,7 @@ dependencies = [
  "enum-map",
  "futures",
  "h2 0.3.26",
- "http 0.2.12",
+ "http 1.1.0",
  "junction-api",
  "k8s-openapi",
  "kube",

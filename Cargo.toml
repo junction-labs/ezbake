@@ -11,7 +11,7 @@ crossbeam-skiplist = "0.1"
 enum-map = "2.7"
 futures = "0.3"
 h2 = "0.3"
-http = "0.2"
+http = "1.1"
 kube = { version = "0.96", features = ["runtime", "client"] }
 metrics = "0.23.0"
 metrics-exporter-prometheus = { version = "0.15.3", default-features = false, features = [
