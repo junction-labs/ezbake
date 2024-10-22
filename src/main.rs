@@ -1,7 +1,10 @@
 use std::{future::Future, time::Duration};
 
 use clap::{Args, Parser};
-use k8s_openapi::api::{core::v1::Service, discovery::v1::EndpointSlice};
+use junction_api::kube::k8s_openapi::{
+    self,
+    api::{core::v1::Service, discovery::v1::EndpointSlice},
+};
 use tonic::{server::NamedService, transport::Server};
 use tracing_subscriber::EnvFilter;
 use xds::{AdsServer, TypedWriters};

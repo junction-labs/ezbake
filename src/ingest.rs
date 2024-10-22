@@ -4,6 +4,9 @@ use std::{
     sync::Arc,
 };
 
+use junction_api::kube::gateway_api;
+use junction_api::kube::k8s_openapi;
+
 use gateway_api::apis::experimental::httproutes::HTTPRoute;
 use junction_api::{backend::Backend, http::Route, Name, ServiceTarget, Target};
 use k8s_openapi::api::{

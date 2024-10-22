@@ -1,6 +1,7 @@
 use futures::TryStreamExt;
-use gateway_api::apis::experimental::httproutes::HTTPRoute;
-use k8s_openapi::{
+use junction_api::kube::gateway_api::apis::experimental::httproutes::HTTPRoute;
+use junction_api::kube::k8s_openapi::{
+    self,
     api::{core::v1::Service, discovery::v1::EndpointSlice},
     serde::Deserialize,
 };
@@ -214,6 +215,7 @@ async fn run_watch<T: KubeResource>(
     let stream = runtime::watcher(api, runtime::watcher::Config::default().any_semantic())
         .default_backoff()
         .modify(T::modify);
+
     let mut stream = std::pin::pin!(stream);
 
     debug!(kind = T::static_kind(), "watch starting");
@@ -264,9 +266,9 @@ fn handle_watch_event<T: KubeResource>(
 ) {
     match &event {
         // on apply, compare with the currently cached version of
-        // the object and only send it if there's a meaningful
+        // the object and only mark it if there's a meaningful
         // change.
-        watcher::Event::Applied(new_obj) => {
+        watcher::Event::Apply(new_obj) => {
             let new_ref = RefAndParents::from_obj(new_obj);
             let old_obj = store.get(&new_ref.obj);
             let has_changed = old_obj.map_or(true, |obj| obj.has_changed(new_obj));
@@ -276,22 +278,37 @@ fn handle_watch_event<T: KubeResource>(
                 debounce.get_or_insert_with(|| Instant::now() + debounce_duration);
             }
         }
-        // On delete, mark everything changed and send it
-        watcher::Event::Deleted(obj) => {
+        // On delete, mark the object as changed and send the ref along.
+        watcher::Event::Delete(obj) => {
             changed.insert(RefAndParents::from_obj(obj));
             debounce.get_or_insert_with(|| Instant::now() + debounce_duration);
         }
-        // on init, mark the union of everything in the Store and
-        // everything new as changed and let downstream figure it out.
-        watcher::Event::Restarted(objs) => {
+        // On init, we mark everything in the store as changed and pause the
+        // debounce timer until InitDone by setting it to None. All objects are
+        // marked changed so we can see which objects may have been deleted.
+        // This is probably worse than buffering the entire init and doing a
+        // diff with the Store.
+        //
+        // While init is happening, any InitApply event gets treated like an
+        // apply, but shouldn't reset the debounce timer.
+        //
+        // When init is done, unpause the debounce timer.
+        //
+        // NOTE: this works because this is called BEFORE events are applied
+        // to the watcher.
+        watcher::Event::Init => {
             trace!(kind = T::static_kind(), "watch restarted");
-            for obj in objs {
-                changed.insert(RefAndParents::from_obj(obj));
-            }
             for obj in store.state() {
                 changed.insert(RefAndParents::from_obj(&obj));
             }
-            debounce.get_or_insert_with(|| Instant::now() + debounce_duration);
+            debounce.take();
+        }
+        watcher::Event::InitApply(new_obj) => {
+            let new_ref = RefAndParents::from_obj(new_obj);
+            changed.insert(new_ref);
+        }
+        watcher::Event::InitDone => {
+            debounce.get_or_insert_with(Instant::now);
         }
     }
 }
