@@ -14,7 +14,7 @@ use xds_api::pb::envoy::{
 };
 
 use crate::xds::resources::ResourceType;
-use crate::xds::{cache::Snapshot, is_nack};
+use crate::xds::{cache::SnapshotCache, is_nack};
 
 use super::cache::ResourceVersion;
 
@@ -129,14 +129,14 @@ pub(crate) struct AdsSubscription {
 pub(crate) struct AdsConnection {
     node: xds_node::Node,
     nonce: u64,
-    snapshot: Snapshot,
+    snapshot: SnapshotCache,
     subscriptions: EnumMap<ResourceType, Option<AdsSubscription>>,
 }
 
 impl AdsConnection {
     pub(crate) fn from_initial_request(
         request: &mut DiscoveryRequest,
-        snapshot: Snapshot,
+        snapshot: SnapshotCache,
     ) -> Result<Self, ConnectionError> {
         match request.node.take() {
             Some(node) => Ok(Self {
@@ -150,7 +150,7 @@ impl AdsConnection {
     }
 
     #[cfg(test)]
-    fn test_new(node: xds_node::Node, snapshot: Snapshot) -> Self {
+    fn test_new(node: xds_node::Node, snapshot: SnapshotCache) -> Self {
         Self {
             nonce: 0,
             node,
@@ -277,7 +277,7 @@ impl AdsSubscription {
     // TODO: don't return an update if nothing has changed!
     fn sotw_update(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &SnapshotCache,
         nonce: &mut u64,
         rtype: ResourceType,
     ) -> Vec<DiscoveryResponse> {
@@ -314,7 +314,7 @@ impl AdsSubscription {
 
     fn incremental_update(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &SnapshotCache,
         nonce: &mut u64,
         rtype: ResourceType,
     ) -> Vec<DiscoveryResponse> {
@@ -419,7 +419,7 @@ impl ResourceNames {
 fn snapshot_iter<'n, 's>(
     resource_type: ResourceType,
     names: &'n ResourceNames,
-    snapshot: &'s Snapshot,
+    snapshot: &'s SnapshotCache,
 ) -> SnapshotIter<'n, 's> {
     match names {
         ResourceNames::EmptyWildcard | ResourceNames::Wildcard(_) => {
@@ -436,7 +436,7 @@ enum SnapshotIter<'n, 's> {
     Explicit(
         ResourceType,
         std::collections::btree_set::Iter<'n, String>,
-        &'s Snapshot,
+        &'s SnapshotCache,
     ),
 }
 
@@ -462,7 +462,7 @@ impl<'n, 's> Iterator for SnapshotIter<'n, 's> {
 #[cfg(test)]
 mod test {
     use crate::xds::cache::ResourceVersion;
-    use crate::xds::SnapshotWriter;
+    use crate::xds::{ResourceSnapshot, SnapshotWriter};
 
     use super::*;
     use xds_api::pb::envoy::config::core::v3::{self as xds_core};
@@ -1042,23 +1042,20 @@ mod test {
             ..Default::default()
         };
 
-        let (snapshot, writer) = new_snapshot_with_writer(
-            ResourceType::ClusterLoadAssignment,
-            [
-                (ResourceType::Listener, vec![(123, "default/nginx")]),
-                (
-                    ResourceType::Cluster,
-                    vec![
-                        (123, "default/nginx/cluster"),
-                        (123, "default/nginx-staging/cluster"),
-                    ],
-                ),
-                (
-                    ResourceType::ClusterLoadAssignment,
-                    vec![(127, "default/nginx/endpoints")],
-                ),
-            ],
-        );
+        let (snapshot, mut writer) = new_snapshot_with_writer([
+            (ResourceType::Listener, vec![(123, "default/nginx")]),
+            (
+                ResourceType::Cluster,
+                vec![
+                    (123, "default/nginx/cluster"),
+                    (123, "default/nginx-staging/cluster"),
+                ],
+            ),
+            (
+                ResourceType::ClusterLoadAssignment,
+                vec![(127, "default/nginx/endpoints")],
+            ),
+        ]);
 
         let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
         let (_, resp) = conn
@@ -1081,14 +1078,13 @@ mod test {
         let next_nonce = &resp[0].nonce;
 
         // update the snapshot with a new endpoint
-        writer.update(
-            ResourceVersion::from_parts(0xBEEF, 124),
-            vec![(
-                "default/nginx-staging/endpoints".to_string(),
-                Some(anything()),
-            )]
-            .into_iter(),
+        let mut snapshot = ResourceSnapshot::new();
+        snapshot.insert_update(
+            ResourceType::ClusterLoadAssignment,
+            "some-endpoints".to_string(),
+            anything(),
         );
+        writer.update(ResourceVersion::from_parts(0xBEEF, 124), snapshot);
 
         // when the client ACKs the first response, it shouldn't change the state of the connection
         let (_, resp) = conn
@@ -1114,54 +1110,29 @@ mod test {
 
     fn new_snapshot(
         data: impl IntoIterator<Item = (ResourceType, Vec<(u64, &'static str)>)>,
-    ) -> Snapshot {
-        let (snapshot, mut writers) = crate::xds::new_snapshot();
-
-        for (rtype, mut names) in data {
-            let writer = writers
-                .for_type(rtype)
-                .expect("resource type specified twice");
-
-            // sort the fake data so that the latest update happens last
-            names.sort_by_key(|(v, _)| *v);
-            for (version, name) in names {
-                writer.update(
-                    ResourceVersion::from_parts(0xBEEF, version),
-                    std::iter::once((name.to_string(), Some(anything()))),
-                );
-            }
-        }
-
-        snapshot
+    ) -> SnapshotCache {
+        let (cache, _writer) = new_snapshot_with_writer(data);
+        cache
     }
 
     fn new_snapshot_with_writer(
-        writer_type: ResourceType,
         data: impl IntoIterator<Item = (ResourceType, Vec<(u64, &'static str)>)>,
-    ) -> (Snapshot, SnapshotWriter) {
-        let (snapshot, mut writers) = crate::xds::new_snapshot();
-        let mut return_writer = None;
-
+    ) -> (SnapshotCache, SnapshotWriter) {
+        let mut snapshot = ResourceSnapshot::new();
+        let mut max_version = 0;
         for (rtype, mut names) in data {
-            let writer = writers
-                .for_type(rtype)
-                .expect("resource type specified twice");
-
-            // sort the fake data so that the latest update happens last
             names.sort_by_key(|(v, _)| *v);
             for (version, name) in names {
-                writer.update(
-                    ResourceVersion::from_parts(0xBEEF, version),
-                    std::iter::once((name.to_string(), Some(anything()))),
-                );
-            }
-
-            if rtype == writer_type {
-                return_writer = Some(writer);
+                max_version = u64::max(max_version, version);
+                snapshot.insert_update(rtype, name.to_string(), anything());
             }
         }
 
-        (snapshot, return_writer.unwrap())
+        let version = ResourceVersion::from_parts(0xBEEF, max_version);
+        let (cache, mut writer) = crate::xds::snapshot_cache();
+        writer.update(version, snapshot);
+
+        (cache, writer)
     }
 
     fn discovery_request(

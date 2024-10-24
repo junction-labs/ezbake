@@ -28,6 +28,7 @@ impl ResourceType {
         }
     }
 
+    #[allow(unused)]
     pub(crate) fn all() -> &'static [Self] {
         &[
             Self::Listener,

@@ -7,7 +7,7 @@ use junction_api::kube::k8s_openapi::{
 };
 use tonic::{server::NamedService, transport::Server};
 use tracing_subscriber::EnvFilter;
-use xds::{AdsServer, TypedWriters};
+use xds::{AdsServer, SnapshotWriter};
 use xds_api::pb::envoy::service::{
     cluster::v3::cluster_discovery_service_server::ClusterDiscoveryServiceServer,
     discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer,
@@ -81,15 +81,15 @@ async fn main() {
     }
 
     let client = kube::Client::try_default().await.unwrap();
-    let (snapshot, writers) = xds::new_snapshot();
+    let (cache, writer) = xds::snapshot_cache();
 
     let ingest = ingest(
         &client,
         args.namespace_args.all_namespaces,
         args.namespace_args.namespace.as_deref(),
-        writers,
+        writer,
     );
-    let serve = serve(&args.listen_addr, snapshot);
+    let serve = serve(&args.listen_addr, cache);
 
     if let Err(e) = tokio::try_join!(ingest, serve) {
         tracing::error!(err = ?e, "exiting: {e}");
@@ -128,7 +128,7 @@ fn setup_tracing(log_pretty: bool) {
     }
 }
 
-async fn serve(addr: &str, snapshot: xds::Snapshot) -> anyhow::Result<()> {
+async fn serve(addr: &str, cache: xds::SnapshotCache) -> anyhow::Result<()> {
     // tonic server structs have a ::NAME string that we register with
     // the reflection server so that reflection only shows what we're
     // implementing, instead of EVERY single xDS api.
@@ -156,7 +156,7 @@ async fn serve(addr: &str, snapshot: xds::Snapshot) -> anyhow::Result<()> {
         }};
     }
 
-    let ads = xds::AdsServer::new(snapshot);
+    let ads = xds::AdsServer::new(cache);
     let server = server_with_reflection!(
         ads => [
             AggregatedDiscoveryServiceServer,
@@ -177,7 +177,7 @@ async fn ingest(
     client: &kube::Client,
     all_namespaces: bool,
     namespace: Option<&str>,
-    mut writers: TypedWriters,
+    writer: SnapshotWriter,
 ) -> anyhow::Result<()> {
     // watch Gateway API routes
     //
@@ -197,7 +197,6 @@ async fn ingest(
             v => v,
         }
     };
-
     // watch Services and EndpointSlices
     let (svc_watch, run_svc_watch) = k8s::watch::<Service>(
         kube_api(client, all_namespaces, namespace),
@@ -208,36 +207,8 @@ async fn ingest(
         Duration::from_secs(2),
     );
 
-    // LDS ingest
-    tokio::spawn({
-        let writer = writers
-            .for_type(xds::ResourceType::Listener)
-            .expect("Listener writer used twice");
-
-        let listeners = ingest::Listeners::new(writer, &svc_watch, &route_watch);
-        listeners.run()
-    });
-
-    // CDS ingest
-    tokio::spawn({
-        let writer = writers
-            .for_type(xds::ResourceType::Cluster)
-            .expect("Cluster writer used twice");
-
-        let clusters = ingest::Clusters::new(writer, &svc_watch);
-        clusters.run()
-    });
-
-    // EDS ingest
-    tokio::spawn({
-        let writer = writers
-            .for_type(xds::ResourceType::ClusterLoadAssignment)
-            .expect("ClusterLoadAssignment writer used twice");
-
-        let clas = ingest::LoadAssignments::new(writer, &slice_watch);
-        clas.run()
-    });
-
+    // ingest::run should
+    tokio::spawn(ingest::run(writer, svc_watch, route_watch, slice_watch));
     tokio::try_join!(
         spawn_watch(run_route_watch),
         spawn_watch(run_slice_watch),

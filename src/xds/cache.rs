@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     num::NonZeroU64,
     str::FromStr,
     sync::{
@@ -15,6 +16,72 @@ use xds_api::pb::google::protobuf;
 
 use crate::xds::resources::ResourceType;
 
+/// A set of updates/deletes to apply to a [SnapshotCache].
+pub(crate) struct ResourceSnapshot {
+    resources: EnumMap<ResourceType, BTreeMap<String, Option<protobuf::Any>>>,
+}
+
+impl ResourceSnapshot {
+    pub(crate) fn new() -> Self {
+        Self {
+            resources: EnumMap::default(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.resources.values().all(|m| m.is_empty())
+    }
+
+    pub(crate) fn update_counts(&self) -> EnumMap<ResourceType, usize> {
+        let mut counts = EnumMap::default();
+
+        for (resource_type, resources) in &self.resources {
+            counts[resource_type] = resources.values().filter(|v| v.is_some()).count()
+        }
+
+        counts
+    }
+
+    pub(crate) fn delete_counts(&self) -> EnumMap<ResourceType, usize> {
+        let mut counts = EnumMap::default();
+
+        for (resource_type, resources) in &self.resources {
+            counts[resource_type] = resources.values().filter(|v| v.is_none()).count()
+        }
+
+        counts
+    }
+
+    pub(crate) fn insert_update(
+        &mut self,
+        resource_type: ResourceType,
+        name: String,
+        proto: protobuf::Any,
+    ) {
+        self.resources[resource_type].insert(name, Some(proto));
+    }
+
+    pub(crate) fn insert_delete(&mut self, resource_type: ResourceType, name: String) {
+        self.resources[resource_type].insert(name, None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn updates_and_deletes(
+        &self,
+        resource_type: ResourceType,
+    ) -> (Vec<String>, Vec<String>) {
+        let resources = &self.resources[resource_type];
+
+        resources
+            .keys()
+            .cloned()
+            .partition(|k| resources.get(k).map_or(false, |v| v.is_some()))
+    }
+}
+
+// FIXME: allow more than one version per ms, since even with the debounce we're
+// updating more than once per ms. the time mask should probably change to find
+// a few more bits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResourceVersion(NonZeroU64);
 
@@ -141,21 +208,6 @@ impl VersionCounter {
 
 pub(crate) type Entry<'a> = crossbeam_skiplist::map::Entry<'a, String, VersionedProto>;
 
-#[derive(Clone)]
-pub(crate) struct Snapshot {
-    inner: Arc<SnapshotInner>,
-}
-
-pub(crate) fn new_snapshot() -> (Snapshot, TypedWriters) {
-    let inner = Arc::new(SnapshotInner::default());
-    (
-        Snapshot {
-            inner: inner.clone(),
-        },
-        TypedWriters::from_inner(inner),
-    )
-}
-
 pub(crate) struct VersionedProto {
     pub version: ResourceVersion,
     pub proto: protobuf::Any,
@@ -170,18 +222,38 @@ impl std::fmt::Debug for VersionedProto {
     }
 }
 
-#[derive(Default)]
-struct SnapshotInner {
-    typed: EnumMap<ResourceType, ResourceSnapshot>,
+pub(crate) fn snapshot_cache() -> (SnapshotCache, SnapshotWriter) {
+    let inner = Arc::new(SnapshotCacheInner::default());
+    (
+        SnapshotCache {
+            inner: inner.clone(),
+        },
+        SnapshotWriter { inner },
+    )
 }
 
 #[derive(Default)]
-struct ResourceSnapshot {
+struct SnapshotCacheInner {
+    typed: EnumMap<ResourceType, ResourceCache>,
+}
+
+#[derive(Default)]
+struct ResourceCache {
     version: AtomicU64,
     resources: SkipMap<String, VersionedProto>,
 }
 
-impl Snapshot {
+/// A read-handle into a versioned cache of xDS snapshots. A cache can have
+/// any number of concurrent readers.
+///
+/// This handle is cheaply cloneable, for sharing the cache between multiple
+/// tasks or threads.
+#[derive(Clone)]
+pub(crate) struct SnapshotCache {
+    inner: Arc<SnapshotCacheInner>,
+}
+
+impl SnapshotCache {
     pub fn version(&self, resource_type: ResourceType) -> Option<ResourceVersion> {
         let v = self.inner.typed[resource_type]
             .version
@@ -191,12 +263,6 @@ impl Snapshot {
 
     pub fn get(&self, resource_type: ResourceType, resource_name: &str) -> Option<Entry> {
         self.inner.typed[resource_type].resources.get(resource_name)
-    }
-
-    pub fn contains(&self, resource_type: ResourceType, resource_name: &str) -> bool {
-        self.inner.typed[resource_type]
-            .resources
-            .contains_key(resource_name)
     }
 
     pub fn len(&self, resource_type: ResourceType) -> usize {
@@ -211,56 +277,36 @@ impl Snapshot {
     }
 }
 
+/// A write handle to a versioned cache of xDS. Write handles cannot be created
+/// directly, and can only be obtained from creating a new cache with
+/// [snapshot_cache].
+///
+/// There should be at most one write handle to a cache at any time.
 pub(crate) struct SnapshotWriter {
-    resource_type: ResourceType,
-    inner: Arc<SnapshotInner>,
+    inner: Arc<SnapshotCacheInner>,
 }
 
 impl SnapshotWriter {
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            inner: self.inner.clone(),
-        }
-    }
+    pub(crate) fn update(&mut self, version: ResourceVersion, snapshot: ResourceSnapshot) {
+        for (resource_type, updates) in snapshot.resources {
+            let cache = &self.inner.typed[resource_type];
 
-    pub fn update(
-        &self,
-        version: ResourceVersion,
-        resources: impl Iterator<Item = (String, Option<protobuf::Any>)>,
-    ) {
-        let typed = &self.inner.typed[self.resource_type];
-
-        typed.version.store(version.to_u64(), Ordering::SeqCst);
-        for (k, v) in resources {
-            match v {
-                Some(proto) => {
-                    typed.resources.insert(k, VersionedProto { version, proto });
-                }
-                None => {
-                    typed.resources.remove(&k);
+            for (name, update) in updates {
+                match update {
+                    Some(proto) => {
+                        let proto = VersionedProto { version, proto };
+                        cache.resources.insert(name, proto);
+                    }
+                    None => {
+                        cache.resources.remove(&name);
+                    }
                 }
             }
+
+            // update the cache version AFTER updating all individual resource
+            // versions so that once you can see the snapshot version change,
+            // changes to all resources are visible as well.
+            cache.version.store(version.to_u64(), Ordering::SeqCst);
         }
-    }
-}
-
-pub(crate) struct TypedWriters {
-    writers: EnumMap<ResourceType, Option<SnapshotWriter>>,
-}
-
-impl TypedWriters {
-    fn from_inner(inner: Arc<SnapshotInner>) -> Self {
-        let mut writers = EnumMap::default();
-        for rtype in ResourceType::all() {
-            writers[*rtype] = Some(SnapshotWriter {
-                resource_type: *rtype,
-                inner: inner.clone(),
-            });
-        }
-        Self { writers }
-    }
-
-    pub(crate) fn for_type(&mut self, resource_type: ResourceType) -> Option<SnapshotWriter> {
-        self.writers[resource_type].take()
     }
 }

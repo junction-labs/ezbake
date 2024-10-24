@@ -82,6 +82,14 @@ pub(crate) use describe_timer;
 /// Creates a timer that runs until it goes out of scope. Timed values are
 /// tracked with a metrics histogram and assumes that durations are recorded as
 /// an f64 number of seconds.
+///
+/// ```no_run
+/// let _timer = scoped_timer!(
+///   "my-timer", "label_one" => "value", "label_two" => "another-value"
+/// );
+///
+///  // do stuff and the timer runs to the end of the current scope
+/// ```
 macro_rules! scoped_timer {
     ($name:expr $(, $label_key:expr $(=> $label_value:expr)?)* $(,)?) => {{
         let hist = ::metrics::histogram!($name $(, $label_key $(=> $label_value)?)*);

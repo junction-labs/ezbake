@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    convert::Infallible,
     str::FromStr,
     sync::Arc,
 };
@@ -15,8 +16,7 @@ use k8s_openapi::api::{
 };
 use kube::runtime::reflector::{ObjectRef, Store};
 
-use tokio::sync::broadcast;
-use tracing::{debug, info, trace};
+use tracing::{debug, info};
 use xds_api::pb::{
     envoy::{
         config::{
@@ -35,20 +35,9 @@ use xds_api::pb::{
 
 use crate::{
     k8s::{ChangedObjects, KubeResource, RefAndParents, Watch},
-    xds::{ResourceType, SnapshotWriter, VersionCounter},
+    metrics::scoped_timer,
+    xds::{ResourceSnapshot, ResourceType, SnapshotWriter, VersionCounter},
 };
-
-// FIXME: switching to targets/ports means that we absolutely want to see the
-// full object on update/delete. we have to account for changes in ports and
-// remove all ports. this is not a perfect answer since we have to be able to
-// handle missing a delete event and seeing e.g. a create (which will only have
-// the new state and not the old state).
-
-// FIXME: Listeners, Clusters, and Endpoints should all be async fn (...) ->
-// Result<(), Error> instead of objects that get immediately new()'d then
-// run()'d.
-
-// FIXME: tests????
 
 /// Shorthand for `protobuf::Any::from_msg(val).expect("...")` with a standard
 /// message.
@@ -63,24 +52,31 @@ macro_rules! into_any {
 /// An error converting resources or getting bad k8s input.
 #[derive(Debug, thiserror::Error)]
 enum IngestError {
-    #[error("invalid object: {0}")]
-    InvalidObject(String),
+    #[error("{obj_ref}: invalid object: {message}")]
+    InvalidObject { obj_ref: String, message: String },
 
     #[error("failed to convert: {0}")]
     InvalidConfig(#[from] junction_api::Error),
 }
 
-// FIXME: should this be in junction-api? maybe as `Target::from_metadata(namespace: Option<&str>, name: &str)`
-fn target_from_ref<K: kube::Resource>(obj_ref: &ObjectRef<K>) -> Result<Target, IngestError> {
-    let name =
-        Name::from_str(&obj_ref.name).map_err(|e| IngestError::InvalidObject(e.to_string()))?;
-
+/// Create a ServiceTarget with no ports from a Serivce
+fn to_service_target(obj_ref: &ObjectRef<Service>) -> Result<Target, IngestError> {
     let namespace = obj_ref
         .namespace
         .as_deref()
-        .ok_or_else(|| IngestError::InvalidObject("missing namespace".to_string()))?;
-    let namespace =
-        Name::from_str(namespace).map_err(|e| IngestError::InvalidObject(e.to_string()))?;
+        .ok_or_else(|| IngestError::InvalidObject {
+            obj_ref: obj_ref.to_string(),
+            message: "missing namespace".to_string(),
+        })?;
+
+    let name = Name::from_str(&obj_ref.name).map_err(|e| IngestError::InvalidObject {
+        obj_ref: obj_ref.to_string(),
+        message: e.to_string(),
+    })?;
+    let namespace = Name::from_str(namespace).map_err(|e| IngestError::InvalidObject {
+        obj_ref: obj_ref.to_string(),
+        message: e.to_string(),
+    })?;
 
     Ok(Target::Service(ServiceTarget {
         name,
@@ -89,303 +85,375 @@ fn target_from_ref<K: kube::Resource>(obj_ref: &ObjectRef<K>) -> Result<Target, 
     }))
 }
 
-/// `Listeners`` listens for changes to either `HTTPRoute`s or `Service`s in
-/// kube and converts them into XDS Listener resources. All Listeners and
-/// route configuration comes from the local cluster.
+/// create an ObjectRef from a ServiceTarget
 ///
-/// A Service should always generate an XDS Listener, with any number of routes
-/// configured for it.
-///
-/// TODO: How many routes should we look for? Is it ok to only allow one per
-/// namespace? What if there are two with conflicting rules?
-pub(crate) struct Listeners {
-    version_counter: VersionCounter,
-    writer: SnapshotWriter,
-    services: Store<Service>,
-    service_changed: broadcast::Receiver<ChangedObjects<Service>>,
-    routes: Store<HTTPRoute>,
-    routes_changed: broadcast::Receiver<ChangedObjects<HTTPRoute>>,
+/// returns None if the target is not a Target::Service
+fn to_service_ref(target: &Target) -> Option<ObjectRef<Service>> {
+    match target {
+        Target::Service(target) => Some(ObjectRef::new(&target.name).within(&target.namespace)),
+        _ => None,
+    }
 }
 
-impl Listeners {
-    pub(crate) fn new(
-        writer: SnapshotWriter,
-        services: &Watch<Service>,
-        routes: &Watch<HTTPRoute>,
-    ) -> Self {
-        Listeners {
-            version_counter: VersionCounter::with_process_prefix(),
-            writer,
-            services: services.store.clone(),
-            service_changed: services.changes.subscribe(),
-            routes: routes.store.clone(),
-            routes_changed: routes.changes.subscribe(),
-        }
-    }
+pub(crate) async fn run(
+    snapshot_writer: SnapshotWriter,
+    services: Watch<Service>,
+    routes: Watch<HTTPRoute>,
+    slices: Watch<EndpointSlice>,
+) -> Infallible {
+    let watches = Watches {
+        services,
+        routes,
+        slices,
+    };
+    let version_counter = VersionCounter::with_process_prefix();
+    let index = IngestIndex::default();
 
-    pub(crate) async fn run(mut self) {
-        loop {
-            tokio::select! {
-                services = self.service_changed.recv() => {
-                    let Ok(objs) = services else {
-                        debug!(resource_type = ?crate::xds::ResourceType::Listener, "ingest exiting");
-                        break;
-                    };
+    run_with(snapshot_writer, watches, version_counter, index).await
+}
 
-                    // time the rest of the select block
-                    let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "Listener", "kube_kind" => "Service");
+async fn run_with(
+    mut snapshot_writer: SnapshotWriter,
+    watches: Watches,
+    version_counter: VersionCounter,
+    mut index: IngestIndex,
+) -> Infallible {
+    let mut svcs = watches.services.changes.subscribe();
+    let mut routes = watches.routes.changes.subscribe();
+    let mut slices = watches.slices.changes.subscribe();
 
-                    let mut updates = vec![];
-                    for obj_ref in &*objs {
-                        match self.service_changed(&obj_ref.obj) {
-                            Ok(update) => updates.extend(update),
-                            Err(e) => info!(route = %obj_ref.obj, err = %e, "updating Listener failed"),
-                        }
-                    }
-                    let version = self.version_counter.next();
-                    self.writer.update(version, updates.into_iter());
-                    debug!(%version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
-                },
-                routes = self.routes_changed.recv() => {
-                    let Ok(objs) = routes else {
-                        debug!(resource_type = ?crate::xds::ResourceType::Listener, "ingest exiting");
-                        break;
-                    };
-
-                    // time the rest of the select block
-                    let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "Listener", "kube_kind" => "HTTPRoute");
-
-                    let mut updates = vec![];
-                    for obj_ref in &*objs {
-                        match self.route_changed(obj_ref) {
-                            Ok(listeners) => updates.extend(listeners),
-                            Err(e) => info!(route = %obj_ref.obj, err = %e, "updating Listener failed"),
-                        }
-                    }
-                    let version = self.version_counter.next();
-                    self.writer.update(version, updates.into_iter());
-                    debug!(%version, changed = objs.len(), resource_type = ?crate::xds::ResourceType::Listener, "updated snapshot");
-                },
-            }
-        }
-    }
-
-    // On service change, unconditionally re-create the default Listener for
-    // this service to pass load balancer info over xDS.
-    //
-    // If there's no Listener registered with the same name and namespace, also
-    // create an empty route pointing at this Service to poulate the DNS name.
-    fn service_changed(
-        &self,
-        svc_ref: &ObjectRef<Service>,
-    ) -> Result<Vec<(String, Option<protobuf::Any>)>, IngestError> {
-        let mut updates = vec![];
-
-        match self.services.get(svc_ref) {
-            Some(svc) => {
-                let backends = Backend::from_service(&svc)?;
-
-                for backend in backends {
-                    // make a default listener for this backend if one doesn't exist
-                    let listener_exists = self
-                        .writer
-                        .snapshot()
-                        .contains(ResourceType::Listener, &backend.target.name());
-                    if !listener_exists {
-                        let listener =
-                            api_listener(Route::passthrough_route(backend.target.clone()).to_xds());
-                        updates.push((listener.name.clone(), Some(into_any!(listener))));
-                    }
-
-                    // make passthrough listener unconditionally
-                    let passthrough_route = backend.to_xds_passthrough_route();
-                    let listener_name = passthrough_route.name.clone();
-                    let listener = api_listener(passthrough_route);
-                    updates.push((listener_name, Some(into_any!(listener))));
+    loop {
+        tokio::select! {
+            svcs = svcs.recv() => {
+                if let Ok(svcs) = svcs {
+                    batch_snapshot(
+                        &mut snapshot_writer,
+                        &version_counter,
+                        svcs,
+                        |snapshot, svc| { index.service_changed(snapshot, &watches.services.store, svc) },
+                    );
                 }
             }
-            None => {
-                // FIXME: this leaks on delete
+            routes = routes.recv() => {
+                if let Ok(routes) = routes {
+                    batch_snapshot(
+                        &mut snapshot_writer,
+                        &version_counter,
+                        routes,
+                        |snapshot, route| { index.httproute_changed(snapshot, &watches.routes.store, &watches.services.store, route) },
+                    );
+                }
+            }
+            slices = slices.recv() => {
+                if let Ok(slices) = slices {
+                    compute_snapshot(
+                        &mut snapshot_writer,
+                        &version_counter,
+                        slices,
+                        |snapshot, slices| {
+                            let slice_svcs = endpoint_slice_services(&*slices);
+                            index.endpoints_changed(snapshot, &watches.slices.store, &slice_svcs)
+                        }
+                    );
+                }
             }
         }
+    }
+}
 
-        Ok(updates)
+fn batch_snapshot<K, F>(
+    writer: &mut SnapshotWriter,
+    version_counter: &VersionCounter,
+    changed_objects: ChangedObjects<K>,
+    mut f: F,
+) where
+    K: KubeResource,
+    F: FnMut(&mut ResourceSnapshot, &ObjectRef<K>) -> Result<(), IngestError>,
+{
+    let _timer = scoped_timer!("snapshot-update", "kube_kind" => K::static_kind());
+    let mut snapshot = ResourceSnapshot::new();
+    for changed in &*changed_objects {
+        if let Err(e) = f(&mut snapshot, &changed.obj) {
+            info!(
+                err = %e,
+                "kube_kind" = K::static_kind(),
+                "object" = %changed.obj,
+                "update failed",
+            );
+        }
     }
 
-    // On HTTPRoute change, convert directly to Junction routes and listeners.
-    fn route_changed(
-        &self,
-        route_ref: &RefAndParents<HTTPRoute>,
-    ) -> Result<Vec<(String, Option<protobuf::Any>)>, IngestError> {
-        let mut updates = vec![];
+    write_snapshot(writer, version_counter, snapshot);
+}
 
-        match self.routes.get(&route_ref.obj) {
+fn compute_snapshot<K, F>(
+    writer: &mut SnapshotWriter,
+    version_counter: &VersionCounter,
+    changed_objects: ChangedObjects<K>,
+    mut f: F,
+) where
+    K: KubeResource,
+    F: FnMut(&mut ResourceSnapshot, ChangedObjects<K>) -> Result<(), IngestError>,
+{
+    let _timer = scoped_timer!("snapshot-update", "kube_kind" => K::static_kind());
+    let mut snapshot = ResourceSnapshot::new();
+
+    if let Err(e) = f(&mut snapshot, changed_objects) {
+        info!(err = %e, "kube_kind" = K::static_kind(), "snapshot update failed")
+    }
+
+    write_snapshot(writer, version_counter, snapshot);
+}
+
+fn write_snapshot(
+    writer: &mut SnapshotWriter,
+    version_counter: &VersionCounter,
+    snapshot: ResourceSnapshot,
+) {
+    if snapshot.is_empty() {
+        return;
+    }
+
+    let version = version_counter.next();
+    let updates = snapshot.update_counts();
+    let deletes = snapshot.delete_counts();
+    debug!(
+        version = %version,
+        // NOTE: updates/deletes are going to serialize as a janky debug string
+        // until the `valuable` feature gets stablizing in `tracing`.
+        //
+        // https://docs.rs/tracing/0.1.40/tracing/index.html#unstable-features
+        // https://docs.rs/valuable/0.1.0/valuable/
+        ?updates,
+        ?deletes,
+        "updated snapshot"
+    );
+    writer.update(version, snapshot);
+}
+
+fn endpoint_slice_services<'a>(
+    slices: impl IntoIterator<Item = &'a RefAndParents<EndpointSlice>>,
+) -> HashSet<ObjectRef<Service>> {
+    let mut parents = HashSet::new();
+    for slice in slices {
+        parents.extend(slice.parents.iter().cloned());
+    }
+    parents
+}
+
+struct Watches {
+    services: Watch<Service>,
+    routes: Watch<HTTPRoute>,
+    slices: Watch<EndpointSlice>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IngestIndex {
+    // track the mapping between HTTPRoutes and the Routes they generate for deletes
+    route_targets: HashMap<ObjectRef<HTTPRoute>, Target>,
+    // an index of Service to [Target], updated every time a Service is seen.
+    // tracked so that on update its possible to know which Backend Targets to
+    // remove.
+    service_targets: HashMap<ObjectRef<Service>, HashSet<Target>>,
+    // an index tracking which CLAs we've generated for a Service. this has to
+    // be tracked independently of service_targets because while kube SHOULD
+    // guarantee that they match, we get the information about creates/deletes
+    // at separate times and have to keep the world sane on our own.
+    cla_targets: HashMap<ObjectRef<Service>, HashSet<Target>>,
+    // the set of Routes created by Services
+    implicit_routes: BTreeSet<Target>,
+    // the set of Routes created by HTTPRoutes
+    explicit_routes: BTreeSet<Target>,
+}
+
+impl IngestIndex {
+    fn httproute_changed(
+        &mut self,
+        snapshot: &mut ResourceSnapshot,
+        routes: &Store<HTTPRoute>,
+        services: &Store<Service>,
+        route_ref: &ObjectRef<HTTPRoute>,
+    ) -> Result<(), IngestError> {
+        match routes.get(route_ref) {
             Some(http_route) => {
                 let route = Route::from_gateway_httproute(&http_route.spec)?;
                 let listener = api_listener(route.to_xds());
+                let xds = into_any!(listener);
 
-                updates.push((route.target.name(), Some(into_any!(listener))));
+                snapshot.insert_update(ResourceType::Listener, listener.name, xds);
+                self.explicit_routes.insert(route.target.clone());
+
+                let old_target = self
+                    .route_targets
+                    .insert(route_ref.clone(), route.target.clone());
+
+                match old_target {
+                    Some(old_target) if old_target != route.target => {
+                        snapshot.insert_delete(ResourceType::Listener, old_target.name());
+                        self.explicit_routes.remove(&old_target);
+                    }
+                    _ => (),
+                }
             }
             None => {
-                for parent_ref in &route_ref.parents {
-                    let target = target_from_ref(parent_ref)?;
-                    updates.push((target.name(), None));
+                if let Some(target) = self.route_targets.remove(route_ref) {
+                    snapshot.insert_delete(ResourceType::Listener, target.name());
+                    self.explicit_routes.remove(&target);
+
+                    // if this route is eligible for an implicit target,
+                    // recreate the implicit target.
+                    if target.port().is_none() && matches!(target, Target::Service(_)) {
+                        // safety: we just checked this is a ServiceTarget with matches!
+                        let svc_ref = to_service_ref(&target).unwrap();
+
+                        if services.get(&svc_ref).is_some() {
+                            let route = Route::passthrough_route(target.clone());
+                            let listener = api_listener(route.to_xds());
+                            let xds = into_any!(listener);
+
+                            self.implicit_routes.insert(target.clone());
+                            snapshot.insert_update(ResourceType::Listener, listener.name, xds);
+                        }
+                    }
                 }
             }
         }
 
-        Ok(updates)
-    }
-}
-
-/// `Clusters` listens for changes to Services in Kubernetes and generates XDS Cluster
-/// resources. Clusters are always pulled from the local cluster.
-pub(crate) struct Clusters {
-    version_counter: VersionCounter,
-    writer: SnapshotWriter,
-    services: Store<Service>,
-    service_changed: broadcast::Receiver<ChangedObjects<Service>>,
-}
-
-impl Clusters {
-    pub(crate) fn new(writer: SnapshotWriter, services: &Watch<Service>) -> Self {
-        Self {
-            version_counter: VersionCounter::with_process_prefix(),
-            writer,
-            services: services.store.clone(),
-            service_changed: services.changes.subscribe(),
-        }
+        Ok(())
     }
 
-    pub(crate) async fn run(mut self) {
-        loop {
-            let Ok(services) = self.service_changed.recv().await else {
-                debug!(resource_type = ?crate::xds::ResourceType::Cluster, "ingest exiting");
-                break;
-            };
-
-            // time each iteration of the loop
-            let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "Cluster", "kube_kind" => "Service");
-
-            let mut updates = vec![];
-            for svc_ref in &*services {
-                match self.service_changed(&svc_ref.obj) {
-                    Ok(clusters) => updates.extend(clusters),
-                    Err(e) => info!(svc = %svc_ref.obj, err = %e, "updating Cluster failed"),
-                }
-            }
-            let version = self.version_counter.next();
-            self.writer.update(version, updates.into_iter());
-            debug!(%version, changed = services.len(), resource_type = ?crate::xds::ResourceType::Cluster, "updated snapshot");
-        }
-    }
-
-    // On every Service change, create/delete a Cluster for every port defined
-    // on this service.
+    /// On service update, we have two main reponsibilities:
+    ///
+    /// - Generate a passthrough listener for the Service so that there's a
+    ///   unique Route pointing at every Backend.
+    ///
+    /// - Make sure there's a Route pointing to this Service with no port. If
+    ///   one has already been overridden
+    ///
+    /// Also have to handle deleting every Cluster
     fn service_changed(
-        &self,
+        &mut self,
+        snapshot: &mut ResourceSnapshot,
+        store: &Store<Service>,
         svc_ref: &ObjectRef<Service>,
-    ) -> Result<Vec<(String, Option<protobuf::Any>)>, IngestError> {
-        let mut updates = vec![];
-        match self.services.get(svc_ref) {
+    ) -> Result<(), IngestError> {
+        match store.get(svc_ref).as_ref() {
             Some(svc) => {
-                let backends = Backend::from_service(&svc)?;
-                let clusters = backends.into_iter().map(|b| {
-                    let cluster = b.to_xds_cluster();
-                    (cluster.name.clone(), Some(into_any!(cluster)))
-                });
-                updates.extend(clusters);
+                let backends = Backend::from_service(svc)?;
+                let mut old_targets = self.service_targets.remove(svc_ref).unwrap_or_default();
+                let mut new_targets = HashSet::with_capacity(backends.len());
+
+                for backend in &backends {
+                    old_targets.remove(&backend.target);
+                    new_targets.insert(backend.target.clone());
+
+                    // update the Cluster for this backend.
+                    let cluster = backend.to_xds_cluster();
+                    let xds = into_any!(cluster);
+                    snapshot.insert_update(ResourceType::Cluster, cluster.name, xds);
+
+                    // update the passthrough listener
+                    let listener = api_listener(backend.to_xds_passthrough_route());
+                    let xds = into_any!(listener);
+                    snapshot.insert_update(ResourceType::Listener, listener.name, xds);
+                }
+
+                // clean up old targets and update the index
+                for target in old_targets {
+                    snapshot.insert_delete(ResourceType::Cluster, target.name());
+                }
+                if !new_targets.is_empty() {
+                    self.service_targets.insert(svc_ref.clone(), new_targets);
+                }
+
+                // if an explicit route hasn't been created for this service,
+                // create an implicit route
+                let default_target = to_service_target(svc_ref)?;
+                if !self.explicit_routes.contains(&default_target) {
+                    let route = Route::passthrough_route(default_target.clone());
+                    let listener = api_listener(route.to_xds());
+                    let xds = into_any!(listener);
+
+                    snapshot.insert_update(ResourceType::Listener, listener.name, xds);
+                    self.implicit_routes.insert(default_target);
+                }
             }
             None => {
-                // FIXME: don't leak Clusters. need to keep an index of service
-                // to port so we can delete
+                // remove the svc from the index
+                let targets = self.service_targets.remove(svc_ref).unwrap_or_default();
+
+                // delete all of the Clusters for those targets and all of the
+                // passthrough listeners
+                for target in &targets {
+                    snapshot.insert_delete(ResourceType::Cluster, target.name());
+                    snapshot.insert_delete(ResourceType::Listener, target.passthrough_route_name());
+                }
+
+                // delete the implicit route if it exists
+                let default_target = to_service_target(svc_ref)?;
+                if self.implicit_routes.remove(&default_target) {
+                    snapshot.insert_delete(ResourceType::Listener, default_target.name());
+                }
             }
         }
 
-        Ok(updates)
+        Ok(())
     }
-}
 
-pub(crate) struct LoadAssignments {
-    version_counter: VersionCounter,
-    writer: SnapshotWriter,
-    slices: Store<EndpointSlice>,
-    slices_changed: broadcast::Receiver<ChangedObjects<EndpointSlice>>,
-}
+    // Triggered when 1 or more services have their EndpointSlices changed.
+    // Groups all endpoint slices by services, and then recomputes CLAs for
+    // changed services.
+    //
+    // This is almost certainly less efficient than keeping an index of Service
+    // to EndpointSlice ourselves and recomputing that way - if you're back here
+    // because this code is slow, try that.
+    //
+    // This function expects something else to do the mapping from EndpointSlice
+    // to Service.
+    fn endpoints_changed<'a, I>(
+        &mut self,
+        snapshot: &mut ResourceSnapshot,
+        store: &Store<EndpointSlice>,
+        services: I,
+    ) -> Result<(), IngestError>
+    where
+        I: IntoIterator<Item = &'a ObjectRef<Service>>,
+    {
+        let mut svc_slices: HashMap<_, _> = services
+            .into_iter()
+            .map(|svc_ref| (svc_ref.clone(), Vec::new()))
+            .collect();
 
-impl LoadAssignments {
-    pub(crate) fn new(writer: SnapshotWriter, slices: &Watch<EndpointSlice>) -> Self {
-        Self {
-            version_counter: VersionCounter::with_process_prefix(),
-            writer,
-            slices: slices.store.clone(),
-            slices_changed: slices.changes.subscribe(),
+        let all_slices = store.state();
+        for slice in all_slices {
+            for svc_ref in slice.parent_refs() {
+                if let Some(slices) = svc_slices.get_mut(&svc_ref) {
+                    slices.push(slice.clone());
+                }
+            }
         }
-    }
 
-    pub(crate) async fn run(mut self) {
-        loop {
-            let Ok(slice_refs) = self.slices_changed.recv().await else {
-                debug!(resource_type = ?crate::xds::ResourceType::ClusterLoadAssignment, "ingest exiting");
-                break;
+        for (svc_ref, slices) in svc_slices {
+            let Ok(target) = to_service_target(&svc_ref) else {
+                continue;
             };
 
-            // time each iteration of the loop
-            let _timer = crate::metrics::scoped_timer!("ingest_time", "xds_type" => "ClusterLoadAssignment", "kube_kind" => "EndpointSlice");
+            let mut new_targets = HashSet::new();
+            let mut old_targets = self.cla_targets.remove(&svc_ref).unwrap_or_default();
 
-            // find all of the Services that changed, and then iterate through
-            // the Store to find all of the EndpointSlices that belong to this
-            // Service. Collect the whole list.
-            //
-            // this should probably be an index of some kind, but don't bother yet.
-            let mut changed_svcs = HashMap::new();
-            for slice_ref in &*slice_refs {
-                for svc_ref in &slice_ref.parents {
-                    changed_svcs.insert(svc_ref, Vec::new());
-                }
+            for (target, cla) in build_clas(&target, slices.iter().map(Arc::as_ref)) {
+                let xds = into_any!(cla);
+                snapshot.insert_update(ResourceType::ClusterLoadAssignment, cla.cluster_name, xds);
+                old_targets.remove(&target);
+                new_targets.insert(target);
             }
 
-            for slice in self.slices.state() {
-                for svc_ref in slice.parent_refs() {
-                    if let Some(slices) = changed_svcs.get_mut(&svc_ref) {
-                        slices.push(slice.clone());
-                    }
-                }
+            for target in old_targets {
+                snapshot.insert_delete(ResourceType::ClusterLoadAssignment, target.name());
             }
-
-            let mut updates = Vec::with_capacity(changed_svcs.len());
-            for (svc_ref, slices) in changed_svcs {
-                let Ok(target) = target_from_ref(svc_ref) else {
-                    continue;
-                };
-
-                if !slices.is_empty() {
-                    trace!(svc = %svc_ref, cla = %target.name(), "building ClusterLoadAssignment");
-
-                    for cla in build_clas(&target, slices.iter().map(Arc::as_ref)) {
-                        let name = cla.cluster_name.clone();
-                        let proto = Some(into_any!(cla));
-                        updates.push((name, proto));
-                    }
-                } else {
-                    trace!(svc = %svc_ref, cla = %target.name(), "deleting ClusterLoadAssignment: service is gone");
-
-                    // FIXME: this leaks on delete - need to track Service ports
-                    updates.push((target.name(), None));
-                }
-            }
-
-            let version = self.version_counter.next();
-            let changed = updates.len();
-            self.writer.update(version, updates.into_iter());
-
-            debug!(
-                %version,
-                changed,
-                resource_type = ?crate::xds::ResourceType::ClusterLoadAssignment,
-                "updated snapshot",
-            );
         }
+
+        Ok(())
     }
 }
 
@@ -428,7 +496,7 @@ fn api_listener(route: xds_route::RouteConfiguration) -> xds_listener::Listener 
 fn build_clas<'a>(
     target: &Target,
     endpoint_slices: impl Iterator<Item = &'a EndpointSlice>,
-) -> Vec<xds_endpoint::ClusterLoadAssignment> {
+) -> Vec<(Target, xds_endpoint::ClusterLoadAssignment)> {
     use xds_core::address::Address;
     use xds_core::socket_address::PortSpecifier;
     use xds_endpoint::lb_endpoint::HostIdentifier;
@@ -497,11 +565,14 @@ fn build_clas<'a>(
 
         let cluster_name = target.name();
         let endpoints = endpoints.collect();
-        clas.push(xds_endpoint::ClusterLoadAssignment {
-            cluster_name,
-            endpoints,
-            ..Default::default()
-        });
+        clas.push((
+            target,
+            xds_endpoint::ClusterLoadAssignment {
+                cluster_name,
+                endpoints,
+                ..Default::default()
+            },
+        ));
     }
 
     clas
@@ -528,4 +599,341 @@ fn is_endpoint_ready(endpoint: &Endpoint) -> bool {
         let ready = conditions.ready.unwrap_or(false);
         conditions.serving.unwrap_or(ready)
     })
+}
+
+// FIXME: need many, many more tests here.
+#[cfg(test)]
+mod test {
+    use k8s_openapi::api::core::v1::ServicePort;
+    use kube::{
+        runtime::{reflector::Lookup, watcher},
+        Resource,
+    };
+    use std::hash::Hash;
+
+    use super::*;
+
+    #[test]
+    fn test_new_service() {
+        let mut index = IngestIndex::default();
+        let mut snapshot = ResourceSnapshot::new();
+
+        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc_ref = ObjectRef::from_obj(&svc);
+        let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        insert(&mut svc_writer, svc);
+
+        let target = to_service_target(&svc_ref).unwrap();
+
+        index
+            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Cluster),
+            (
+                vec![target.with_port(8009).name(), target.with_port(8010).name()],
+                vec![],
+            ),
+            "Cluster updates",
+        );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (
+                vec![
+                    target.without_port().name(),
+                    target.with_port(8009).passthrough_route_name(),
+                    target.with_port(8010).passthrough_route_name(),
+                ],
+                vec![]
+            ),
+            "Listener updates",
+        );
+    }
+
+    // deleting a service should remove all of the clusters/listeners created
+    #[test]
+    fn test_create_delete_service() {
+        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc_ref = ObjectRef::from_obj(&svc);
+        let svc_target = to_service_target(&svc_ref).unwrap();
+
+        let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        insert(&mut svc_writer, svc.clone());
+
+        let mut index = IngestIndex::default();
+        index
+            .service_changed(&mut ResourceSnapshot::new(), &svc_store, &svc_ref)
+            .unwrap();
+
+        delete(&mut svc_writer, svc);
+
+        let mut snapshot = ResourceSnapshot::new();
+        index
+            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Cluster),
+            (
+                vec![],
+                vec![
+                    svc_target.with_port(8009).name(),
+                    svc_target.with_port(8010).name()
+                ],
+            ),
+            "service delete a Cluster for each port",
+        );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (
+                vec![],
+                vec![
+                    svc_target.name(),
+                    svc_target.with_port(8009).passthrough_route_name(),
+                    svc_target.with_port(8010).passthrough_route_name(),
+                ],
+            ),
+            "service should delete LB passthrough listeners and the default listener",
+        );
+    }
+
+    // updating on a service not in the index and store we shouldn't do
+    // anything, because it means we never saw the create to add it to the
+    // cache/index.
+    #[test]
+    fn test_service_changed_gone() {
+        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc_ref = ObjectRef::from_obj(&svc);
+
+        let (svc_store, _) = kube::runtime::reflector::store();
+
+        let mut index = IngestIndex::default();
+        let mut snapshot = ResourceSnapshot::new();
+        index
+            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .unwrap();
+
+        assert!(snapshot.is_empty(), "should do nothing");
+    }
+
+    // creating a new service after an HTTPRoute exists for it shouldn't create
+    // implicit Routes for it.
+    #[test]
+    fn test_new_service_route_exists() {
+        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc_ref = ObjectRef::from_obj(&svc);
+        let svc_target = to_service_target(&svc_ref).unwrap();
+
+        let httproute = example_route("coolsvc-pass", "prod", svc_target.clone());
+        let httproute_ref = ObjectRef::from_obj(&httproute);
+
+        let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        insert(&mut svc_writer, svc);
+
+        let (route_store, mut route_writer) = kube::runtime::reflector::store();
+        insert(&mut route_writer, httproute);
+
+        let mut index = IngestIndex::default();
+
+        let mut snapshot = ResourceSnapshot::new();
+        index
+            .httproute_changed(&mut snapshot, &route_store, &svc_store, &httproute_ref)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (vec![svc_target.without_port().name()], vec![]),
+            "route should create a Listener",
+        );
+
+        let mut snapshot = ResourceSnapshot::new();
+        index
+            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Cluster),
+            (
+                vec![
+                    svc_target.with_port(8009).name(),
+                    svc_target.with_port(8010).name()
+                ],
+                vec![],
+            ),
+            "service should create a Cluster for each port",
+        );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (
+                vec![
+                    svc_target.with_port(8009).passthrough_route_name(),
+                    svc_target.with_port(8010).passthrough_route_name(),
+                ],
+                vec![]
+            ),
+            "service should only create LB passthrough listeners",
+        );
+    }
+
+    // creating an explicit route for a Service should delete any implicit
+    // routes that were already created.
+    #[test]
+    fn test_new_route_service_exists() {
+        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc_ref = ObjectRef::from_obj(&svc);
+        let svc_target = to_service_target(&svc_ref).unwrap();
+
+        let httproute = example_route("coolsvc-pass", "prod", svc_target.clone());
+        let httproute_ref = ObjectRef::from_obj(&httproute);
+
+        let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        insert(&mut svc_writer, svc);
+
+        let (route_store, mut route_writer) = kube::runtime::reflector::store();
+        insert(&mut route_writer, httproute);
+
+        let mut index = IngestIndex::default();
+
+        let mut snapshot = ResourceSnapshot::new();
+        index
+            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Cluster),
+            (
+                vec![
+                    svc_target.with_port(8009).name(),
+                    svc_target.with_port(8010).name()
+                ],
+                vec![],
+            ),
+            "service should create a Cluster for each port",
+        );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (
+                vec![
+                    svc_target.name(),
+                    svc_target.with_port(8009).passthrough_route_name(),
+                    svc_target.with_port(8010).passthrough_route_name(),
+                ],
+                vec![]
+            ),
+            "service create passthrough and implicit routes",
+        );
+
+        let mut snapshot = ResourceSnapshot::new();
+        index
+            .httproute_changed(&mut snapshot, &route_store, &svc_store, &httproute_ref)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (vec![svc_target.without_port().name()], vec![]),
+            "route should create a Listener that overrides the passthrough",
+        );
+    }
+
+    // deleting a route for an existing service should re-create the implicit
+    // route for that service.
+    #[test]
+    fn test_delete_route_service_exists() {
+        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc_ref = ObjectRef::from_obj(&svc);
+        let svc_target = to_service_target(&svc_ref).unwrap();
+
+        let httproute = example_route("coolsvc-pass", "prod", svc_target.clone());
+        let httproute_ref = ObjectRef::from_obj(&httproute);
+
+        let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        insert(&mut svc_writer, svc);
+
+        let (route_store, mut route_writer) = kube::runtime::reflector::store();
+        insert(&mut route_writer, httproute.clone());
+
+        // create the index and insert both the service and route
+        let mut index = IngestIndex::default();
+        let mut snapshot = ResourceSnapshot::new();
+        index
+            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .unwrap();
+        index
+            .httproute_changed(&mut snapshot, &route_store, &svc_store, &httproute_ref)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (
+                vec![
+                    svc_target.name(),
+                    svc_target.with_port(8009).passthrough_route_name(),
+                    svc_target.with_port(8010).passthrough_route_name(),
+                ],
+                vec![]
+            ),
+            "passthrough and implicit routes were created",
+        );
+
+        // delete the route from the store
+        delete(&mut route_writer, httproute);
+
+        let mut snapshot = ResourceSnapshot::new();
+        index
+            .httproute_changed(&mut snapshot, &route_store, &svc_store, &httproute_ref)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (vec![svc_target.name(),], vec![]),
+            "route should be replaced with the implicit route",
+        )
+    }
+
+    fn insert<K>(store: &mut kube::runtime::reflector::store::Writer<K>, object: K)
+    where
+        K: 'static + Lookup + Clone,
+        <K as Lookup>::DynamicType: Eq + Hash + Clone,
+    {
+        store.apply_watcher_event(&watcher::Event::Apply(object));
+    }
+
+    fn delete<K>(store: &mut kube::runtime::reflector::store::Writer<K>, object: K)
+    where
+        K: 'static + Lookup + Clone,
+        <K as Lookup>::DynamicType: Eq + Hash + Clone,
+    {
+        store.apply_watcher_event(&watcher::Event::Delete(object));
+    }
+
+    fn example_route(namespace: &'static str, name: &'static str, target: Target) -> HTTPRoute {
+        Route::passthrough_route(target)
+            .to_gateway_httproute(namespace, name)
+            .unwrap()
+    }
+
+    fn example_service(
+        namespace: &'static str,
+        name: &'static str,
+        ports: &'static [(&'static str, u16)],
+    ) -> Service {
+        let mut svc = Service::default();
+        svc.meta_mut().name = Some(name.to_string());
+        svc.meta_mut().namespace = Some(namespace.to_string());
+
+        let spec = svc.spec.get_or_insert_with(Default::default);
+
+        let mut svc_ports = vec![];
+        for &(name, port) in ports {
+            svc_ports.push(ServicePort {
+                name: Some(name.to_string()),
+                port: port as i32,
+                ..Default::default()
+            });
+        }
+        spec.ports = Some(svc_ports);
+
+        svc
+    }
 }
