@@ -128,7 +128,7 @@ fn setup_tracing(log_pretty: bool) {
     }
 }
 
-async fn serve(addr: &str, snapshot: xds::Snapshot) -> anyhow::Result<()> {
+async fn serve(addr: &str, snapshot: xds::SnapshotCache) -> anyhow::Result<()> {
     // tonic server structs have a ::NAME string that we register with
     // the reflection server so that reflection only shows what we're
     // implementing, instead of EVERY single xDS api.

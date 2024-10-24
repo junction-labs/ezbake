@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     num::NonZeroU64,
     str::FromStr,
     sync::{
@@ -15,6 +16,34 @@ use xds_api::pb::google::protobuf;
 
 use crate::xds::resources::ResourceType;
 
+pub(crate) struct ResourceSnapshot {
+    resources: EnumMap<ResourceType, BTreeMap<String, Option<protobuf::Any>>>,
+}
+
+impl ResourceSnapshot {
+    pub(crate) fn new() -> Self {
+        todo!()
+    }
+    pub(crate) fn insert_update(
+        &mut self,
+        resource_type: ResourceType,
+        name: String,
+        proto: protobuf::Any,
+    ) {
+        todo!()
+    }
+
+    pub(crate) fn insert_delete(&mut self, resource_type: ResourceType, name: String) {
+        todo!()
+    }
+}
+
+pub(crate) struct VersionedProto {
+    pub version: ResourceVersion,
+    pub proto: protobuf::Any,
+}
+
+// FIXME: allow more than one version per ms. expand to two u64s?
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResourceVersion(NonZeroU64);
 
@@ -142,23 +171,18 @@ impl VersionCounter {
 pub(crate) type Entry<'a> = crossbeam_skiplist::map::Entry<'a, String, VersionedProto>;
 
 #[derive(Clone)]
-pub(crate) struct Snapshot {
-    inner: Arc<SnapshotInner>,
+pub(crate) struct SnapshotCache {
+    inner: Arc<SnapshotCacheInner>,
 }
 
-pub(crate) fn new_snapshot() -> (Snapshot, TypedWriters) {
-    let inner = Arc::new(SnapshotInner::default());
+pub(crate) fn new_snapshot() -> (SnapshotCache, TypedWriters) {
+    let inner = Arc::new(SnapshotCacheInner::default());
     (
-        Snapshot {
+        SnapshotCache {
             inner: inner.clone(),
         },
         TypedWriters::from_inner(inner),
     )
-}
-
-pub(crate) struct VersionedProto {
-    pub version: ResourceVersion,
-    pub proto: protobuf::Any,
 }
 
 impl std::fmt::Debug for VersionedProto {
@@ -171,17 +195,17 @@ impl std::fmt::Debug for VersionedProto {
 }
 
 #[derive(Default)]
-struct SnapshotInner {
-    typed: EnumMap<ResourceType, ResourceSnapshot>,
+struct SnapshotCacheInner {
+    typed: EnumMap<ResourceType, ResourceCache>,
 }
 
 #[derive(Default)]
-struct ResourceSnapshot {
+struct ResourceCache {
     version: AtomicU64,
     resources: SkipMap<String, VersionedProto>,
 }
 
-impl Snapshot {
+impl SnapshotCache {
     pub fn version(&self, resource_type: ResourceType) -> Option<ResourceVersion> {
         let v = self.inner.typed[resource_type]
             .version
@@ -213,12 +237,12 @@ impl Snapshot {
 
 pub(crate) struct SnapshotWriter {
     resource_type: ResourceType,
-    inner: Arc<SnapshotInner>,
+    inner: Arc<SnapshotCacheInner>,
 }
 
 impl SnapshotWriter {
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot {
+    pub fn snapshot(&self) -> SnapshotCache {
+        SnapshotCache {
             inner: self.inner.clone(),
         }
     }
@@ -249,7 +273,7 @@ pub(crate) struct TypedWriters {
 }
 
 impl TypedWriters {
-    fn from_inner(inner: Arc<SnapshotInner>) -> Self {
+    fn from_inner(inner: Arc<SnapshotCacheInner>) -> Self {
         let mut writers = EnumMap::default();
         for rtype in ResourceType::all() {
             writers[*rtype] = Some(SnapshotWriter {
@@ -262,5 +286,13 @@ impl TypedWriters {
 
     pub(crate) fn for_type(&mut self, resource_type: ResourceType) -> Option<SnapshotWriter> {
         self.writers[resource_type].take()
+    }
+
+    pub(crate) fn contains(&self, resource_type: ResourceType, name: &str) -> bool {
+        todo!()
+    }
+
+    pub(crate) fn update(&self, version: ResourceVersion, snapshot: ResourceSnapshot) {
+        todo!()
     }
 }

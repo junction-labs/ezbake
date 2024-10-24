@@ -28,19 +28,19 @@ use xds_api::pb::envoy::service::{
 
 use crate::{
     grpc_access,
-    xds::{AdsConnection, ResourceType, Snapshot},
+    xds::{AdsConnection, ResourceType, SnapshotCache},
 };
 
 use super::connection::ConnectionSnapshot;
 
 #[derive(Clone)]
 pub(crate) struct AdsServer {
-    snapshot: Snapshot,
+    snapshot: SnapshotCache,
     clients: ConnectionSnapshot,
 }
 
 impl AdsServer {
-    pub(crate) fn new(snapshot: Snapshot) -> Self {
+    pub(crate) fn new(snapshot: SnapshotCache) -> Self {
         Self {
             snapshot,
             clients: Default::default(),
@@ -109,7 +109,7 @@ macro_rules! try_send {
     )
 )]
 async fn stream_ads(
-    snapshot: Snapshot,
+    snapshot: SnapshotCache,
     clients: ConnectionSnapshot,
     remote_addr: Option<SocketAddr>,
     mut requests: Streaming<DiscoveryRequest>,

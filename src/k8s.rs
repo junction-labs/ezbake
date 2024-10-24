@@ -119,13 +119,10 @@ impl KubeResource for EndpointSlice {
     }
 
     fn parent_refs(&self) -> Vec<ObjectRef<Self::ParentRef>> {
-        let Some(labels) = self.metadata.labels.as_ref() else {
-            return Vec::new();
-        };
         let Some(svc_namespace) = self.metadata.namespace.as_ref() else {
             return Vec::new();
         };
-        let Some(svc_name) = labels.get("kubernetes.io/service-name") else {
+        let Some(svc_name) = self.labels().get("kubernetes.io/service-name") else {
             return Vec::new();
         };
 

@@ -14,7 +14,7 @@ use xds_api::pb::envoy::{
 };
 
 use crate::xds::resources::ResourceType;
-use crate::xds::{cache::Snapshot, is_nack};
+use crate::xds::{cache::SnapshotCache, is_nack};
 
 use super::cache::ResourceVersion;
 
@@ -129,14 +129,14 @@ pub(crate) struct AdsSubscription {
 pub(crate) struct AdsConnection {
     node: xds_node::Node,
     nonce: u64,
-    snapshot: Snapshot,
+    snapshot: SnapshotCache,
     subscriptions: EnumMap<ResourceType, Option<AdsSubscription>>,
 }
 
 impl AdsConnection {
     pub(crate) fn from_initial_request(
         request: &mut DiscoveryRequest,
-        snapshot: Snapshot,
+        snapshot: SnapshotCache,
     ) -> Result<Self, ConnectionError> {
         match request.node.take() {
             Some(node) => Ok(Self {
@@ -150,7 +150,7 @@ impl AdsConnection {
     }
 
     #[cfg(test)]
-    fn test_new(node: xds_node::Node, snapshot: Snapshot) -> Self {
+    fn test_new(node: xds_node::Node, snapshot: SnapshotCache) -> Self {
         Self {
             nonce: 0,
             node,
@@ -277,7 +277,7 @@ impl AdsSubscription {
     // TODO: don't return an update if nothing has changed!
     fn sotw_update(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &SnapshotCache,
         nonce: &mut u64,
         rtype: ResourceType,
     ) -> Vec<DiscoveryResponse> {
@@ -314,7 +314,7 @@ impl AdsSubscription {
 
     fn incremental_update(
         &mut self,
-        snapshot: &Snapshot,
+        snapshot: &SnapshotCache,
         nonce: &mut u64,
         rtype: ResourceType,
     ) -> Vec<DiscoveryResponse> {
@@ -419,7 +419,7 @@ impl ResourceNames {
 fn snapshot_iter<'n, 's>(
     resource_type: ResourceType,
     names: &'n ResourceNames,
-    snapshot: &'s Snapshot,
+    snapshot: &'s SnapshotCache,
 ) -> SnapshotIter<'n, 's> {
     match names {
         ResourceNames::EmptyWildcard | ResourceNames::Wildcard(_) => {
@@ -436,7 +436,7 @@ enum SnapshotIter<'n, 's> {
     Explicit(
         ResourceType,
         std::collections::btree_set::Iter<'n, String>,
-        &'s Snapshot,
+        &'s SnapshotCache,
     ),
 }
 
@@ -1114,7 +1114,7 @@ mod test {
 
     fn new_snapshot(
         data: impl IntoIterator<Item = (ResourceType, Vec<(u64, &'static str)>)>,
-    ) -> Snapshot {
+    ) -> SnapshotCache {
         let (snapshot, mut writers) = crate::xds::new_snapshot();
 
         for (rtype, mut names) in data {
@@ -1138,7 +1138,7 @@ mod test {
     fn new_snapshot_with_writer(
         writer_type: ResourceType,
         data: impl IntoIterator<Item = (ResourceType, Vec<(u64, &'static str)>)>,
-    ) -> (Snapshot, SnapshotWriter) {
+    ) -> (SnapshotCache, SnapshotWriter) {
         let (snapshot, mut writers) = crate::xds::new_snapshot();
         let mut return_writer = None;
 
