@@ -28,21 +28,21 @@ use xds_api::pb::envoy::service::{
 
 use crate::{
     grpc_access,
-    xds::{AdsConnection, ResourceType, Snapshot},
+    xds::{AdsConnection, ResourceType, SnapshotCache},
 };
 
 use super::connection::ConnectionSnapshot;
 
 #[derive(Clone)]
 pub(crate) struct AdsServer {
-    snapshot: Snapshot,
+    cache: SnapshotCache,
     clients: ConnectionSnapshot,
 }
 
 impl AdsServer {
-    pub(crate) fn new(snapshot: Snapshot) -> Self {
+    pub(crate) fn new(cache: SnapshotCache) -> Self {
         Self {
-            snapshot,
+            cache,
             clients: Default::default(),
         }
     }
@@ -56,7 +56,7 @@ impl AdsServer {
 
         grpc_access::xds_discovery_request(&request);
 
-        let Some(snapshot_version) = self.snapshot.version(resource_type) else {
+        let Some(snapshot_version) = self.cache.version(resource_type) else {
             return Err(Status::unavailable("no snapshot available"));
         };
 
@@ -68,12 +68,12 @@ impl AdsServer {
 
         let mut resources = Vec::with_capacity(request.resource_names.len());
         if request.resource_names.is_empty() {
-            for e in self.snapshot.iter(resource_type) {
+            for e in self.cache.iter(resource_type) {
                 resources.push(e.value().proto.clone());
             }
         } else {
             for name in &request.resource_names {
-                if let Some(e) = self.snapshot.get(resource_type, name) {
+                if let Some(e) = self.cache.get(resource_type, name) {
                     resources.push(e.value().proto.clone())
                 }
             }
@@ -109,7 +109,7 @@ macro_rules! try_send {
     )
 )]
 async fn stream_ads(
-    snapshot: Snapshot,
+    snapshot: SnapshotCache,
     clients: ConnectionSnapshot,
     remote_addr: Option<SocketAddr>,
     mut requests: Streaming<DiscoveryRequest>,
@@ -379,7 +379,7 @@ impl AggregatedDiscoveryService for AdsServer {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
 
         tokio::spawn(stream_ads(
-            self.snapshot.clone(),
+            self.cache.clone(),
             self.clients.clone(),
             remote_addr,
             requests,
