@@ -5,8 +5,11 @@ use std::{
     sync::Arc,
 };
 
-use junction_api::kube::gateway_api;
-use junction_api::kube::k8s_openapi;
+use junction_api::{http::WeightedTarget, kube::gateway_api};
+use junction_api::{
+    http::{PathMatch, RouteMatch, RouteRule},
+    kube::k8s_openapi,
+};
 
 use gateway_api::apis::experimental::httproutes::HTTPRoute;
 use junction_api::{backend::Backend, http::Route, Name, ServiceTarget, Target};
@@ -306,8 +309,9 @@ impl IngestIndex {
                         // safety: we just checked this is a ServiceTarget with matches!
                         let svc_ref = to_service_ref(&target).unwrap();
 
-                        if services.get(&svc_ref).is_some() {
-                            let route = Route::passthrough_route(target.clone());
+                        if let Some(svc) = services.get(&svc_ref) {
+                            let default_port = first_port(&svc).unwrap_or(80);
+                            let route = passthrough_route(target.clone(), default_port);
                             let listener = api_listener(route.to_xds());
                             let xds = into_any!(listener);
 
@@ -370,7 +374,8 @@ impl IngestIndex {
                 // create an implicit route
                 let default_target = to_service_target(svc_ref)?;
                 if !self.explicit_routes.contains(&default_target) {
-                    let route = Route::passthrough_route(default_target.clone());
+                    let default_port = first_port(svc).unwrap_or(80);
+                    let route = passthrough_route(default_target.clone(), default_port);
                     let listener = api_listener(route.to_xds());
                     let xds = into_any!(listener);
 
@@ -454,6 +459,32 @@ impl IngestIndex {
         }
 
         Ok(())
+    }
+}
+
+fn first_port(svc: &Service) -> Option<u16> {
+    let spec = svc.spec.as_ref()?;
+    let first_port = spec.ports.as_ref()?.first()?;
+
+    first_port.port.try_into().ok()
+}
+
+// a passthrough route that forces a port
+fn passthrough_route(target: Target, backend_port: u16) -> Route {
+    let backend = WeightedTarget {
+        weight: 1,
+        target: target.with_port(backend_port),
+    };
+    Route {
+        target,
+        rules: vec![RouteRule {
+            matches: vec![RouteMatch {
+                path: Some(PathMatch::empty_prefix()),
+                ..Default::default()
+            }],
+            backends: vec![backend],
+            ..Default::default()
+        }],
     }
 }
 
