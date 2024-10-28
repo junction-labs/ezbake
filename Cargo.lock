@@ -606,7 +606,7 @@ dependencies = [
  "junction-api",
  "k8s-openapi",
  "kube",
- "metrics 0.23.0",
+ "metrics",
  "metrics-exporter-prometheus",
  "once_cell",
  "smol_str",
@@ -1402,16 +1402,6 @@ checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
 
 [[package]]
 name = "metrics"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "884adb57038347dfbaf2d5065887b6cf4312330dc8e94bc30a1a839bd79d3261"
-dependencies = [
- "ahash",
- "portable-atomic",
-]
-
-[[package]]
-name = "metrics"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae428771d17306715c5091d446327d1cfdedc82185c65ba8423ab404e45bf10"
@@ -1432,7 +1422,7 @@ dependencies = [
  "hyper-util",
  "indexmap 2.6.0",
  "ipnet",
- "metrics 0.24.0",
+ "metrics",
  "metrics-util",
  "quanta",
  "thiserror",
@@ -1449,7 +1439,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.0",
- "metrics 0.24.0",
+ "metrics",
  "quanta",
  "sketches-ddsketch",
 ]
