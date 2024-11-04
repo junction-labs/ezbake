@@ -8,6 +8,7 @@ use std::{
 use crossbeam_skiplist::SkipMap;
 use enum_map::EnumMap;
 use smol_str::{SmolStr, ToSmolStr};
+use tracing::trace;
 use xds_api::pb::envoy::{
     config::core::v3 as xds_node,
     service::discovery::v3::{DiscoveryRequest, DiscoveryResponse},
@@ -194,7 +195,7 @@ impl AdsConnection {
             .map_err(|e| ConnectionError::InvalidRequest(e.into()))?;
         let request_nonce = nonempty_then(&request.response_nonce, SmolStr::new);
         if request_nonce != sub.last_sent_nonce {
-            tracing::trace!(
+            trace!(
                 v = request.version_info,
                 n = request.response_nonce,
                 ty = request.type_url,
@@ -250,6 +251,11 @@ impl AdsConnection {
             return Vec::new();
         };
 
+        trace!(
+            sub_last_sent_version = ?sub.last_sent_version,
+            snapshot_version = ?self.snapshot.version(changed_type),
+            "snapshot updated",
+        );
         if sub.last_sent_version == self.snapshot.version(changed_type) {
             return Vec::new();
         }
@@ -1129,7 +1135,7 @@ mod test {
         }
 
         let version = ResourceVersion::from_parts(0xBEEF, max_version);
-        let (cache, mut writer) = crate::xds::snapshot_cache();
+        let (cache, mut writer) = crate::xds::snapshot();
         writer.update(version, snapshot);
 
         (cache, writer)

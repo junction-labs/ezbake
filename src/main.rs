@@ -81,7 +81,7 @@ async fn main() {
     }
 
     let client = kube::Client::try_default().await.unwrap();
-    let (cache, writer) = xds::snapshot_cache();
+    let (cache, writer) = xds::snapshot();
 
     let ingest = ingest(
         &client,
