@@ -12,6 +12,8 @@ use std::{
 use crossbeam_skiplist::SkipMap;
 use enum_map::EnumMap;
 use once_cell::sync::Lazy;
+use tokio::sync::broadcast::{self, error::RecvError};
+use tracing::warn;
 use xds_api::pb::google::protobuf;
 
 use crate::xds::resources::ResourceType;
@@ -19,6 +21,17 @@ use crate::xds::resources::ResourceType;
 /// A set of updates/deletes to apply to a [SnapshotCache].
 pub(crate) struct ResourceSnapshot {
     resources: EnumMap<ResourceType, BTreeMap<String, Option<protobuf::Any>>>,
+}
+
+impl std::fmt::Debug for ResourceSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut dbg_struct = f.debug_struct("ResourceSnapshot");
+        for (resource_type, resources) in &self.resources {
+            let keys: Vec<_> = resources.keys().collect();
+            dbg_struct.field(resource_type.type_url(), &keys);
+        }
+        dbg_struct.finish()
+    }
 }
 
 impl ResourceSnapshot {
@@ -222,7 +235,10 @@ impl std::fmt::Debug for VersionedProto {
     }
 }
 
-pub(crate) fn snapshot_cache() -> (SnapshotCache, SnapshotWriter) {
+/// Create a new [SnapshotCache] and a paired [SnapshotWriter]. The writer is
+/// the only way to safely write to this cache - don't drop it if you need to
+/// write.
+pub(crate) fn snapshot() -> (SnapshotCache, SnapshotWriter) {
     let inner = Arc::new(SnapshotCacheInner::default());
     (
         SnapshotCache {
@@ -232,25 +248,37 @@ pub(crate) fn snapshot_cache() -> (SnapshotCache, SnapshotWriter) {
     )
 }
 
-#[derive(Default)]
-struct SnapshotCacheInner {
-    typed: EnumMap<ResourceType, ResourceCache>,
-}
-
-#[derive(Default)]
-struct ResourceCache {
-    version: AtomicU64,
-    resources: SkipMap<String, VersionedProto>,
-}
-
-/// A read-handle into a versioned cache of xDS snapshots. A cache can have
-/// any number of concurrent readers.
+/// A read handle into a versioned cache of xDS snapshots. A cache can have any
+/// number of concurrent readers.
 ///
 /// This handle is cheaply cloneable, for sharing the cache between multiple
 /// tasks or threads.
 #[derive(Clone)]
 pub(crate) struct SnapshotCache {
     inner: Arc<SnapshotCacheInner>,
+}
+
+struct SnapshotCacheInner {
+    typed: EnumMap<ResourceType, ResourceCache>,
+    notifications: broadcast::Sender<ResourceType>,
+}
+
+impl Default for SnapshotCacheInner {
+    fn default() -> Self {
+        Self {
+            typed: Default::default(),
+            // 12 = 3 cache updates for each of 4 types of resource type.
+            //
+            // this is completely arbitrary.
+            notifications: broadcast::Sender::new(12),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResourceCache {
+    version: AtomicU64,
+    resources: SkipMap<String, VersionedProto>,
 }
 
 impl SnapshotCache {
@@ -275,6 +303,40 @@ impl SnapshotCache {
     ) -> crossbeam_skiplist::map::Iter<String, VersionedProto> {
         self.inner.typed[resource_type].resources.iter()
     }
+
+    pub fn changes(&self) -> SnapshotChange {
+        SnapshotChange {
+            _inner: self.inner.clone(),
+            notifications: self.inner.notifications.subscribe(),
+        }
+    }
+}
+
+/// A handle to a cache that notifies on cache change.
+pub(crate) struct SnapshotChange {
+    notifications: broadcast::Receiver<ResourceType>,
+    // hold a reference to inner to guarantee the sender half of the
+    // channel can't drop.
+    _inner: Arc<SnapshotCacheInner>,
+}
+
+impl SnapshotChange {
+    pub async fn changed(&mut self) -> ResourceType {
+        loop {
+            match self.notifications.recv().await {
+                Ok(rtype) => return rtype,
+                Err(RecvError::Lagged(n)) => {
+                    warn!(
+                        dropped_notifications = %n,
+                        "cache subscription fell behind."
+                    );
+                }
+                Err(RecvError::Closed) => panic!(
+                    "snapshot subscription dropped. this is a bug in ezbake, please report it"
+                ),
+            }
+        }
+    }
 }
 
 /// A write handle to a versioned cache of xDS. Write handles cannot be created
@@ -291,6 +353,7 @@ impl SnapshotWriter {
         for (resource_type, updates) in snapshot.resources {
             let cache = &self.inner.typed[resource_type];
 
+            let mut changed = false;
             for (name, update) in updates {
                 match update {
                     Some(proto) => {
@@ -301,12 +364,18 @@ impl SnapshotWriter {
                         cache.resources.remove(&name);
                     }
                 }
+
+                changed = true;
             }
 
-            // update the cache version AFTER updating all individual resource
-            // versions so that once you can see the snapshot version change,
-            // changes to all resources are visible as well.
-            cache.version.store(version.to_u64(), Ordering::SeqCst);
+            if changed {
+                // update the cache version AFTER updating all individual resource
+                // versions so that once you can see the snapshot version change,
+                // changes to all resources are visible as well.
+                cache.version.store(version.to_u64(), Ordering::SeqCst);
+                // ignore the error. it just means there's nothing to do
+                let _ = self.inner.notifications.send(resource_type);
+            }
         }
     }
 }
