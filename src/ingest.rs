@@ -270,6 +270,7 @@ impl IngestIndex {
                 let xds = into_any!(listener);
 
                 snapshot.insert_update(ResourceType::Listener, listener.name, xds);
+                self.implicit_routes.remove(&route.vhost);
                 self.explicit_routes.insert(route.vhost.clone());
 
                 let old_target = self
@@ -357,6 +358,10 @@ impl IngestIndex {
 
                 // if an explicit route hasn't been created for this service,
                 // create an implicit route
+                //
+                // TODO: why isn't this tracked in the service_targets index?
+                // should it be?  that would make deletes easier, and would mean
+                // we can ditch to_service_target(...) here.
                 let implicit_vhost = to_service_target(svc_ref)?.into_vhost(None);
                 if !self.explicit_routes.contains(&implicit_vhost) {
                     let default_port = first_port(svc).unwrap_or(80);
@@ -836,6 +841,12 @@ mod test {
             .service_changed(&mut snapshot, &svc_store, &svc_ref)
             .unwrap();
 
+        assert!(
+            index
+                .implicit_routes
+                .contains(&svc_target.clone().into_vhost(None)),
+            "vhost should tracked as having an implicit route"
+        );
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Cluster),
             (
@@ -873,8 +884,14 @@ mod test {
 
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Listener),
-            (vec![svc_target.into_vhost(None).name()], vec![]),
+            (vec![svc_target.clone().into_vhost(None).name()], vec![]),
             "route should create a Listener that overrides the passthrough",
+        );
+        assert!(
+            !index
+                .implicit_routes
+                .contains(&svc_target.clone().into_vhost(None)),
+            "vhost should not be tracked as having an implicit route"
         );
     }
 
