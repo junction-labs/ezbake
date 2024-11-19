@@ -296,8 +296,7 @@ impl IngestIndex {
                             let backends = Backend::from_service(&svc).unwrap();
                             let vhost = implicit_vhost(svc_ref, &backends)?;
 
-                            let default_port = first_port(&svc).unwrap_or(80);
-                            let route = implicit_route(&vhost.target, default_port);
+                            let route = implicit_route(&vhost.target);
                             let listener = api_listener(route.to_xds());
                             let xds = into_any!(listener);
 
@@ -362,8 +361,7 @@ impl IngestIndex {
                 // we can ditch to_service_target(...) here.
                 let implicit_vhost = implicit_vhost(svc_ref, &backends)?;
                 if !self.explicit_routes.contains(&implicit_vhost) {
-                    let default_port = first_port(svc).unwrap_or(80);
-                    let route = implicit_route(&implicit_vhost.target, default_port);
+                    let route = implicit_route(&implicit_vhost.target);
                     let listener = api_listener(route.to_xds());
                     let xds = into_any!(listener);
 
@@ -454,13 +452,6 @@ impl IngestIndex {
     }
 }
 
-fn first_port(svc: &Service) -> Option<u16> {
-    let spec = svc.spec.as_ref()?;
-    let first_port = spec.ports.as_ref()?.first()?;
-
-    first_port.port.try_into().ok()
-}
-
 fn implicit_vhost(
     svc_ref: &ObjectRef<Service>,
     backends: &[Backend],
@@ -486,29 +477,16 @@ fn implicit_vhost(
 }
 
 // a passthrough route that forces a port
-//
-// TODO: why are we forcing a port?
-fn implicit_route(target: &Target, backend_port: u16) -> Route {
-    let backend = target.clone().into_backend(backend_port);
+fn implicit_route(target: &Target) -> Route {
     let vhost = target.clone().into_vhost(None);
 
-    let tags = BTreeMap::from_iter([(
+    let mut route = Route::passthrough_route(vhost);
+    route.tags = BTreeMap::from_iter([(
         junction_api::http::tags::GENERATED_BY.to_string(),
         "ezbake".to_string(),
     )]);
 
-    Route {
-        vhost,
-        tags,
-        rules: vec![RouteRule {
-            matches: vec![RouteMatch {
-                path: Some(PathMatch::empty_prefix()),
-                ..Default::default()
-            }],
-            backends: vec![WeightedBackend { weight: 1, backend }],
-            ..Default::default()
-        }],
-    }
+    route
 }
 
 /// Wrap a Listener with an api_listener around a RouteConfiguration and serve it
