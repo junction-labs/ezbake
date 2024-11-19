@@ -4,11 +4,8 @@ use std::{
     sync::Arc,
 };
 
-use junction_api::{http::WeightedBackend, kube::gateway_api, BackendId, VirtualHost};
-use junction_api::{
-    http::{PathMatch, RouteMatch, RouteRule},
-    kube::k8s_openapi,
-};
+use junction_api::kube::{gateway_api, k8s_openapi};
+use junction_api::{BackendId, VirtualHost};
 
 use gateway_api::apis::experimental::httproutes::HTTPRoute;
 use junction_api::{backend::Backend, http::Route, Target};
@@ -72,16 +69,6 @@ fn to_service_target(obj_ref: &ObjectRef<Service>) -> Result<Target, IngestError
         })?;
 
     Ok(Target::kube_service(namespace, &obj_ref.name)?)
-}
-
-/// create an ObjectRef from a ServiceTarget
-///
-/// returns None if the target is not a Target::Service
-fn to_service_ref(target: &Target) -> Option<ObjectRef<Service>> {
-    match target {
-        Target::KubeService(svc) => Some(ObjectRef::new(&svc.name).within(&svc.namespace)),
-        _ => None,
-    }
 }
 
 pub(crate) async fn run(
@@ -236,10 +223,12 @@ struct Watches {
     slices: Watch<EndpointSlice>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 struct IngestIndex {
     // track the mapping between HTTPRoutes and the Routes they generate for deletes
     route_targets: HashMap<ObjectRef<HTTPRoute>, VirtualHost>,
+    // an inverted index from vhost to the service that it's an implicit route for.
+    implicit_targets: HashMap<VirtualHost, ObjectRef<Service>>,
     // an index of Service to [Target], updated every time a Service is seen.
     // tracked so that on update its possible to know which Backend Targets to
     // remove.
@@ -256,6 +245,16 @@ struct IngestIndex {
 }
 
 impl IngestIndex {
+    /// Update the index when an HTTPRoute changes.
+    ///
+    /// On update, translate the HTTPRoute to a junction Route, add it to the
+    /// current snapshot as an update, and track it in the index. If the same
+    /// HTTPRoute had previously generated an old route, remove it. Mark the
+    /// Route as an explicit route.
+    ///
+    /// On delete, remove the HTTPRoute from the index and remove the route. If
+    /// the Route targeted an existing kube Service that now no longer has a
+    /// Route, re-generate an implicit one.
     fn httproute_changed(
         &mut self,
         snapshot: &mut ResourceSnapshot,
@@ -290,12 +289,13 @@ impl IngestIndex {
                     snapshot.insert_delete(ResourceType::Listener, vhost.name());
                     self.explicit_routes.remove(&vhost);
 
-                    // if this vhost is eligible to be implicit vhost, recreate it
-                    if vhost.port.is_none() && matches!(vhost.target, Target::KubeService(_)) {
-                        // safety: we just checked this is a ServiceTarget with matches!
-                        let svc_ref = to_service_ref(&vhost.target).unwrap();
+                    // if this vhost maps back to a service and that service
+                    // exists right now, create a Route for it.
+                    if let Some(svc_ref) = self.implicit_targets.get(&vhost) {
+                        if let Some(svc) = services.get(svc_ref) {
+                            let backends = Backend::from_service(&svc).unwrap();
+                            let vhost = implicit_vhost(svc_ref, &backends)?;
 
-                        if let Some(svc) = services.get(&svc_ref) {
                             let default_port = first_port(&svc).unwrap_or(80);
                             let route = implicit_route(&vhost.target, default_port);
                             let listener = api_listener(route.to_xds());
@@ -314,13 +314,11 @@ impl IngestIndex {
 
     /// On service update, we have two main reponsibilities:
     ///
-    /// - Generate a passthrough listener for the Service so that there's a
-    ///   unique Route pointing at every Backend.
+    /// Generate a passthrough listener for the Service so that there's a unique
+    /// Route pointing at every Backend.
     ///
-    /// - Make sure there's a Route pointing to this Service with no port. If
-    ///   one has already been overridden
-    ///
-    /// Also have to handle deleting every Cluster
+    /// Make sure there's a Route pointing to this Service. If one has already
+    /// been created by an HTTPRoute, do nothing.
     fn service_changed(
         &mut self,
         snapshot: &mut ResourceSnapshot,
@@ -362,7 +360,7 @@ impl IngestIndex {
                 // TODO: why isn't this tracked in the service_targets index?
                 // should it be?  that would make deletes easier, and would mean
                 // we can ditch to_service_target(...) here.
-                let implicit_vhost = to_service_target(svc_ref)?.into_vhost(None);
+                let implicit_vhost = implicit_vhost(svc_ref, &backends)?;
                 if !self.explicit_routes.contains(&implicit_vhost) {
                     let default_port = first_port(svc).unwrap_or(80);
                     let route = implicit_route(&implicit_vhost.target, default_port);
@@ -370,7 +368,9 @@ impl IngestIndex {
                     let xds = into_any!(listener);
 
                     snapshot.insert_update(ResourceType::Listener, listener.name, xds);
-                    self.implicit_routes.insert(implicit_vhost);
+                    self.implicit_routes.insert(implicit_vhost.clone());
+                    self.implicit_targets
+                        .insert(implicit_vhost, svc_ref.clone());
                 }
             }
             None => {
@@ -386,7 +386,9 @@ impl IngestIndex {
 
                 // delete the implicit route if it exists
                 let implicit_vhost = to_service_target(svc_ref)?.into_vhost(None);
-                if self.implicit_routes.remove(&implicit_vhost) {
+                let removed = self.implicit_routes.remove(&implicit_vhost)
+                    || self.implicit_targets.remove(&implicit_vhost).is_some();
+                if removed {
                     snapshot.insert_delete(ResourceType::Listener, implicit_vhost.name());
                 }
             }
@@ -459,7 +461,33 @@ fn first_port(svc: &Service) -> Option<u16> {
     first_port.port.try_into().ok()
 }
 
+fn implicit_vhost(
+    svc_ref: &ObjectRef<Service>,
+    backends: &[Backend],
+) -> Result<VirtualHost, IngestError> {
+    match backends {
+        [] => Err(IngestError::InvalidObject {
+            obj_ref: svc_ref.to_string(),
+            message: "Service has no backends".to_string(),
+        }),
+        [backend] => Ok(backend.id.target.clone().into_vhost(None)),
+        [first, rest @ ..] => {
+            for backend in rest {
+                if backend.id.target != first.id.target {
+                    return Err(IngestError::InvalidObject {
+                        obj_ref: svc_ref.to_string(),
+                        message: "Service backends have more than one Target".to_string(),
+                    });
+                }
+            }
+            Ok(first.id.target.clone().into_vhost(None))
+        }
+    }
+}
+
 // a passthrough route that forces a port
+//
+// TODO: why are we forcing a port?
 fn implicit_route(target: &Target, backend_port: u16) -> Route {
     let backend = target.clone().into_backend(backend_port);
     let vhost = target.clone().into_vhost(None);
@@ -644,12 +672,12 @@ mod test {
         let mut index = IngestIndex::default();
         let mut snapshot = ResourceSnapshot::new();
 
-        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service("prod", "coolsvc", &[("http", 8009), ("https", 8010)]);
         let svc_ref = ObjectRef::from_obj(&svc);
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
         insert(&mut svc_writer, svc);
 
-        let target = to_service_target(&svc_ref).unwrap();
+        let target = Target::kube_service("prod", "coolsvc").unwrap();
 
         index
             .service_changed(&mut snapshot, &svc_store, &svc_ref)
@@ -680,10 +708,50 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_new_externalname_service() {
+        let mut index = IngestIndex::default();
+        let mut snapshot = ResourceSnapshot::new();
+
+        let svc = externalname_service("prod", "coolsvc", "api.junctionlabs.io");
+        let svc_ref = ObjectRef::from_obj(&svc);
+        let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        insert(&mut svc_writer, svc);
+
+        let target = Target::dns("api.junctionlabs.io").unwrap();
+
+        index
+            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Cluster),
+            (
+                vec![
+                    target.clone().into_backend(443).name(),
+                    target.clone().into_backend(80).name(),
+                ],
+                vec![],
+            ),
+            "Cluster updates",
+        );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (
+                vec![
+                    target.clone().into_vhost(None).name(),
+                    target.clone().into_backend(443).passthrough_route_name(),
+                    target.clone().into_backend(80).passthrough_route_name(),
+                ],
+                vec![]
+            ),
+            "Listener updates",
+        );
+    }
     // deleting a service should remove all of the clusters/listeners created
     #[test]
     fn test_create_delete_service() {
-        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
         let svc_ref = ObjectRef::from_obj(&svc);
         let svc_target = to_service_target(&svc_ref).unwrap();
 
@@ -738,7 +806,7 @@ mod test {
     // cache/index.
     #[test]
     fn test_service_changed_gone() {
-        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
         let svc_ref = ObjectRef::from_obj(&svc);
 
         let (svc_store, _) = kube::runtime::reflector::store();
@@ -756,7 +824,7 @@ mod test {
     // implicit Routes for it.
     #[test]
     fn test_new_service_route_exists() {
-        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
         let svc_ref = ObjectRef::from_obj(&svc);
         let svc_target = to_service_target(&svc_ref).unwrap();
 
@@ -821,7 +889,7 @@ mod test {
     // routes that were already created.
     #[test]
     fn test_new_route_service_exists() {
-        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
         let svc_ref = ObjectRef::from_obj(&svc);
         let svc_target = to_service_target(&svc_ref).unwrap();
 
@@ -895,15 +963,64 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_delete_route_cluserip_service_exists() {
+        let svc = clusterip_service("prod", "coolsvc", &[("http", 8009), ("https", 8010)]);
+        let svc_target = Target::kube_service("prod", "coolsvc").unwrap();
+
+        test_delete_route(
+            svc_target.clone(),
+            svc,
+            // initial update should create HTTPRoute listener and config listeners
+            vec![
+                svc_target.name(),
+                svc_target
+                    .clone()
+                    .into_backend(8009)
+                    .passthrough_route_name(),
+                svc_target
+                    .clone()
+                    .into_backend(8010)
+                    .passthrough_route_name(),
+            ],
+            // deleting the HTTProute should update the named listener
+            vec![svc_target.name()],
+        );
+    }
+
+    #[test]
+    fn test_delete_route_externalname_service_exists() {
+        let svc = externalname_service("prod", "coolsvc", "coolapi.com");
+        let svc_target = Target::dns("coolapi.com").unwrap();
+
+        test_delete_route(
+            svc_target.clone(),
+            svc,
+            // initial update should create HTTPRoute listener and config listeners
+            vec![
+                svc_target.name(),
+                svc_target
+                    .clone()
+                    .into_backend(443)
+                    .passthrough_route_name(),
+                svc_target.clone().into_backend(80).passthrough_route_name(),
+            ],
+            // deleting the HTTProute should update the named listener
+            vec![svc_target.name()],
+        );
+    }
+
     // deleting a route for an existing service should re-create the implicit
     // route for that service.
-    #[test]
-    fn test_delete_route_service_exists() {
-        let svc = example_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+    fn test_delete_route(
+        svc_target: Target,
+        svc: Service,
+        initial_updates: Vec<String>,
+        updates_after_delete: Vec<String>,
+    ) {
         let svc_ref = ObjectRef::from_obj(&svc);
-        let svc_target = to_service_target(&svc_ref).unwrap();
 
-        let httproute = example_route("coolsvc-pass", "prod", svc_target.clone().into_vhost(None));
+        let httproute = example_route("prod", "example-route", svc_target.clone().into_vhost(None));
         let httproute_ref = ObjectRef::from_obj(&httproute);
 
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
@@ -924,20 +1041,7 @@ mod test {
 
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Listener),
-            (
-                vec![
-                    svc_target.name(),
-                    svc_target
-                        .clone()
-                        .into_backend(8009)
-                        .passthrough_route_name(),
-                    svc_target
-                        .clone()
-                        .into_backend(8010)
-                        .passthrough_route_name(),
-                ],
-                vec![]
-            ),
+            (initial_updates, vec![]),
             "passthrough and implicit routes were created",
         );
 
@@ -951,7 +1055,7 @@ mod test {
 
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Listener),
-            (vec![svc_target.name(),], vec![]),
+            (updates_after_delete, vec![]),
             "route should be replaced with the implicit route",
         )
     }
@@ -978,7 +1082,7 @@ mod test {
             .unwrap()
     }
 
-    fn example_service(
+    fn clusterip_service(
         namespace: &'static str,
         name: &'static str,
         ports: &'static [(&'static str, u16)],
@@ -988,6 +1092,7 @@ mod test {
         svc.meta_mut().namespace = Some(namespace.to_string());
 
         let spec = svc.spec.get_or_insert_with(Default::default);
+        spec.type_ = Some("ClusterIP".to_string());
 
         let mut svc_ports = vec![];
         for &(name, port) in ports {
@@ -998,6 +1103,22 @@ mod test {
             });
         }
         spec.ports = Some(svc_ports);
+
+        svc
+    }
+
+    fn externalname_service(
+        namespace: &'static str,
+        name: &'static str,
+        hostname: &'static str,
+    ) -> Service {
+        let mut svc = Service::default();
+        svc.meta_mut().name = Some(name.to_string());
+        svc.meta_mut().namespace = Some(namespace.to_string());
+
+        let spec = svc.spec.get_or_insert_with(Default::default);
+        spec.type_ = Some("ExternalName".to_string());
+        spec.external_name = Some(hostname.to_string());
 
         svc
     }
