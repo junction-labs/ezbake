@@ -9,13 +9,16 @@ use junction_api::{BackendId, VirtualHost};
 
 use gateway_api::apis::experimental::httproutes::HTTPRoute;
 use junction_api::{backend::Backend, http::Route, Target};
-use k8s_openapi::api::{
-    core::v1::Service,
-    discovery::v1::{Endpoint, EndpointSlice},
+use k8s_openapi::{
+    api::{
+        core::v1::Service,
+        discovery::v1::{Endpoint, EndpointSlice},
+    },
+    apimachinery::pkg::util::intstr::IntOrString,
 };
 use kube::runtime::reflector::{ObjectRef, Store};
 
-use tracing::{debug, info};
+use tracing::{debug, info, trace, warn};
 use xds_api::pb::{
     envoy::{
         config::{
@@ -128,8 +131,13 @@ async fn run_with(
                         slices,
                         |snapshot, slices| {
                             let slice_svcs = endpoint_slice_services(&*slices);
-                            index.endpoints_changed(snapshot, &watches.slices.store, &slice_svcs)
-                        }
+                            index.endpoints_changed(
+                                snapshot,
+                                &watches.services.store,
+                                &watches.slices.store,
+                                &slice_svcs,
+                            )
+                        },
                     );
                 }
             }
@@ -169,13 +177,15 @@ fn compute_snapshot<K, F>(
     mut f: F,
 ) where
     K: KubeResource,
-    F: FnMut(&mut ResourceSnapshot, ChangedObjects<K>) -> Result<(), IngestError>,
+    F: FnMut(&mut ResourceSnapshot, ChangedObjects<K>) -> Result<(), Vec<IngestError>>,
 {
     let _timer = scoped_timer!("snapshot-update", "kube_kind" => K::static_kind());
     let mut snapshot = ResourceSnapshot::new();
 
-    if let Err(e) = f(&mut snapshot, changed_objects) {
-        info!(err = %e, "kube_kind" = K::static_kind(), "snapshot update failed")
+    if let Err(errs) = f(&mut snapshot, changed_objects) {
+        for err in errs {
+            warn!(%err, "kube_kind" = K::static_kind(), "snapshot update failed")
+        }
     }
 
     write_snapshot(writer, version_counter, snapshot);
@@ -229,9 +239,8 @@ struct IngestIndex {
     route_targets: HashMap<ObjectRef<HTTPRoute>, VirtualHost>,
     // an inverted index from vhost to the service that it's an implicit route for.
     implicit_targets: HashMap<VirtualHost, ObjectRef<Service>>,
-    // an index of Service to [Target], updated every time a Service is seen.
-    // tracked so that on update its possible to know which Backend Targets to
-    // remove.
+    // an index of Service to [BackendId], updated every time a Service is seen.
+    // tracked so that on update its possible to know which Backends to remove.
     service_targets: HashMap<ObjectRef<Service>, HashSet<BackendId>>,
     // an index tracking which CLAs we've generated for a Service. this has to
     // be tracked independently of service_targets because while kube SHOULD
@@ -405,21 +414,28 @@ impl IngestIndex {
     //
     // This function expects something else to do the mapping from EndpointSlice
     // to Service.
+    //
+    // FIXME: there's a race here - the Services every EndpointSlice is attached to
+    // need to exist before we can actual calculate CLAs because that requires the
+    // reverse mapping from `targetPort` back to `port`. On the rare occasion we
+    // lose the race, there should be some way to infer the mapping (or assume that
+    // port == targetPort) and then recompute everything when the Service appears.
     fn endpoints_changed<'a, I>(
         &mut self,
         snapshot: &mut ResourceSnapshot,
-        store: &Store<EndpointSlice>,
+        svc_store: &Store<Service>,
+        slice_store: &Store<EndpointSlice>,
         services: I,
-    ) -> Result<(), IngestError>
+    ) -> Result<(), Vec<IngestError>>
     where
         I: IntoIterator<Item = &'a ObjectRef<Service>>,
     {
         let mut svc_slices: HashMap<_, _> = services
             .into_iter()
-            .map(|svc_ref| (svc_ref.clone(), Vec::new()))
+            .map(|svc_ref| (svc_ref, Vec::new()))
             .collect();
 
-        let all_slices = store.state();
+        let all_slices = slice_store.state();
         for slice in all_slices {
             for svc_ref in slice.parent_refs() {
                 if let Some(slices) = svc_slices.get_mut(&svc_ref) {
@@ -428,15 +444,28 @@ impl IngestIndex {
             }
         }
 
+        let mut errors = vec![];
         for (svc_ref, slices) in svc_slices {
-            let Ok(target) = to_service_target(&svc_ref) else {
+            let Some(svc) = svc_store.get(svc_ref) else {
+                trace!(%svc_ref, "skipping endpointSlice: Service does not exist");
+                continue;
+            };
+            let port_lookup = match service_ports(svc_ref, &svc) {
+                Ok(lookup) => lookup,
+                Err(e) => {
+                    errors.push(e);
+                    continue;
+                }
+            };
+
+            let Ok(target) = to_service_target(svc_ref) else {
                 continue;
             };
 
             let mut new_targets = HashSet::new();
-            let mut old_targets = self.cla_targets.remove(&svc_ref).unwrap_or_default();
+            let mut old_targets = self.cla_targets.remove(svc_ref).unwrap_or_default();
 
-            for (target, cla) in build_clas(&target, slices.iter().map(Arc::as_ref)) {
+            for (target, cla) in build_clas(&target, &port_lookup, slices.iter().map(Arc::as_ref)) {
                 let xds = into_any!(cla);
                 snapshot.insert_update(ResourceType::ClusterLoadAssignment, cla.cluster_name, xds);
                 old_targets.remove(&target);
@@ -448,7 +477,11 @@ impl IngestIndex {
             }
         }
 
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 
@@ -527,6 +560,7 @@ fn api_listener(route: xds_route::RouteConfiguration) -> xds_listener::Listener 
 
 fn build_clas<'a>(
     svc_target: &Target,
+    port_lookup: &HashMap<(String, u16), u16>,
     endpoint_slices: impl Iterator<Item = &'a EndpointSlice>,
 ) -> Vec<(BackendId, xds_endpoint::ClusterLoadAssignment)> {
     use xds_core::address::Address;
@@ -537,12 +571,22 @@ fn build_clas<'a>(
     let mut endpoints: BTreeMap<BackendId, BTreeMap<String, Vec<_>>> = BTreeMap::new();
 
     for endpoint_slice in endpoint_slices {
-        let ports = endpoint_slice_ports(endpoint_slice);
-        if ports.is_empty() {
+        if &endpoint_slice.address_type != "IPv4" {
             continue;
         }
 
-        for port in ports {
+        let slice_ports = endpoint_slice_ports(endpoint_slice);
+        if slice_ports.is_empty() {
+            continue;
+        }
+
+        for (name, target_port) in slice_ports {
+            let Some(&port) = port_lookup.get(&(name, target_port)) else {
+                continue;
+            };
+
+            // the actual backend should be named with the "frontend" port to
+            // match incoming service traffic.
             let backend = svc_target.clone().into_backend(port);
             for endpoint in &endpoint_slice.endpoints {
                 if !is_endpoint_ready(endpoint) {
@@ -559,7 +603,8 @@ fn build_clas<'a>(
                 for address in &endpoint.addresses {
                     let socket_addr = xds_core::SocketAddress {
                         address: address.clone(),
-                        port_specifier: Some(PortSpecifier::PortValue(port as u32)),
+                        // the ACTUAL port should be the target_port
+                        port_specifier: Some(PortSpecifier::PortValue(target_port as u32)),
                         ..Default::default()
                     };
 
@@ -610,7 +655,54 @@ fn build_clas<'a>(
     clas
 }
 
-fn endpoint_slice_ports(slice: &EndpointSlice) -> Vec<u16> {
+// this sucks, the fact that targetPort can be a String is terrible!
+fn service_ports(
+    svc_ref: &ObjectRef<Service>,
+    svc: &Service,
+) -> Result<HashMap<(String, u16), u16>, IngestError> {
+    let Some(spec) = svc.spec.as_ref() else {
+        return Err(IngestError::InvalidObject {
+            obj_ref: svc_ref.to_string(),
+            message: "missing spec".to_string(),
+        });
+    };
+
+    let svc_ports = spec.ports.as_deref().unwrap_or_default();
+
+    let mut mapping = HashMap::new();
+    for svc_port in svc_ports {
+        let port: u16 = svc_port
+            .port
+            .try_into()
+            .map_err(|_| IngestError::InvalidObject {
+                obj_ref: svc_ref.to_string(),
+                message: format!("invalid port value: {}", svc_port.port),
+            })?;
+
+        let target_port: u16 = match svc_port.target_port.as_ref() {
+            Some(IntOrString::Int(port)) => {
+                (*port).try_into().map_err(|_| IngestError::InvalidObject {
+                    obj_ref: svc_ref.to_string(),
+                    message: format!("invalid port value: {port}"),
+                })?
+            }
+            Some(IntOrString::String(name)) => {
+                return Err(IngestError::InvalidObject {
+                    obj_ref: svc_ref.to_string(),
+                    message: format!("can't use named port '{name}' as a targetPort"),
+                });
+            }
+            None => port,
+        };
+
+        let port_name = svc_port.name.clone().unwrap_or_default();
+        mapping.insert((port_name, target_port), port);
+    }
+
+    Ok(mapping)
+}
+
+fn endpoint_slice_ports(slice: &EndpointSlice) -> Vec<(String, u16)> {
     let Some(slice_ports) = &slice.ports else {
         return Vec::new();
     };
@@ -618,10 +710,11 @@ fn endpoint_slice_ports(slice: &EndpointSlice) -> Vec<u16> {
     let mut ports = Vec::with_capacity(slice_ports.len());
     for port in slice_ports {
         let Some(port_no) = port.port else { continue };
+        let port_name = port.name.clone().unwrap_or_default();
         let Ok(port_no) = port_no.try_into() else {
             continue;
         };
-        ports.push(port_no);
+        ports.push((port_name, port_no));
     }
     ports
 }
@@ -636,10 +729,16 @@ fn is_endpoint_ready(endpoint: &Endpoint) -> bool {
 // FIXME: need many, many more tests here.
 #[cfg(test)]
 mod test {
-    use k8s_openapi::api::core::v1::ServicePort;
+    use k8s_openapi::{
+        api::{
+            core::v1::ServicePort,
+            discovery::v1::{EndpointConditions, EndpointPort},
+        },
+        apimachinery::pkg::util::intstr::IntOrString,
+    };
     use kube::{
         runtime::{reflector::Lookup, watcher},
-        Resource,
+        Resource, ResourceExt,
     };
     use std::hash::Hash;
 
@@ -650,7 +749,11 @@ mod test {
         let mut index = IngestIndex::default();
         let mut snapshot = ResourceSnapshot::new();
 
-        let svc = clusterip_service("prod", "coolsvc", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service(
+            "prod",
+            "coolsvc",
+            &[("http", 80, 8009), ("https", 443, 8010)],
+        );
         let svc_ref = ObjectRef::from_obj(&svc);
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
         insert(&mut svc_writer, svc);
@@ -665,8 +768,8 @@ mod test {
             snapshot.updates_and_deletes(ResourceType::Cluster),
             (
                 vec![
-                    target.clone().into_backend(8009).name(),
-                    target.clone().into_backend(8010).name()
+                    target.clone().into_backend(443).name(),
+                    target.clone().into_backend(80).name(),
                 ],
                 vec![],
             ),
@@ -677,8 +780,8 @@ mod test {
             (
                 vec![
                     target.clone().into_vhost(None).name(),
-                    target.clone().into_backend(8009).passthrough_route_name(),
-                    target.clone().into_backend(8010).passthrough_route_name(),
+                    target.clone().into_backend(443).passthrough_route_name(),
+                    target.clone().into_backend(80).passthrough_route_name(),
                 ],
                 vec![]
             ),
@@ -729,7 +832,11 @@ mod test {
     // deleting a service should remove all of the clusters/listeners created
     #[test]
     fn test_create_delete_service() {
-        let svc = clusterip_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service(
+            "coolsvc",
+            "prod",
+            &[("http", 80, 8009), ("https", 443, 8010)],
+        );
         let svc_ref = ObjectRef::from_obj(&svc);
         let svc_target = to_service_target(&svc_ref).unwrap();
 
@@ -753,8 +860,8 @@ mod test {
             (
                 vec![],
                 vec![
-                    svc_target.clone().into_backend(8009).name(),
-                    svc_target.clone().into_backend(8010).name()
+                    svc_target.clone().into_backend(443).name(),
+                    svc_target.clone().into_backend(80).name()
                 ],
             ),
             "service delete a Cluster for each port",
@@ -767,12 +874,9 @@ mod test {
                     svc_target.clone().into_vhost(None).name(),
                     svc_target
                         .clone()
-                        .into_backend(8009)
+                        .into_backend(443)
                         .passthrough_route_name(),
-                    svc_target
-                        .clone()
-                        .into_backend(8010)
-                        .passthrough_route_name(),
+                    svc_target.clone().into_backend(80).passthrough_route_name(),
                 ],
             ),
             "service should delete LB passthrough listeners and the default listener",
@@ -784,7 +888,11 @@ mod test {
     // cache/index.
     #[test]
     fn test_service_changed_gone() {
-        let svc = clusterip_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service(
+            "coolsvc",
+            "prod",
+            &[("http", 80, 8009), ("https", 443, 8010)],
+        );
         let svc_ref = ObjectRef::from_obj(&svc);
 
         let (svc_store, _) = kube::runtime::reflector::store();
@@ -802,7 +910,11 @@ mod test {
     // implicit Routes for it.
     #[test]
     fn test_new_service_route_exists() {
-        let svc = clusterip_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service(
+            "coolsvc",
+            "prod",
+            &[("http", 80, 8009), ("https", 443, 8010)],
+        );
         let svc_ref = ObjectRef::from_obj(&svc);
         let svc_target = to_service_target(&svc_ref).unwrap();
 
@@ -837,8 +949,8 @@ mod test {
             snapshot.updates_and_deletes(ResourceType::Cluster),
             (
                 vec![
-                    svc_target.clone().into_backend(8009).name(),
-                    svc_target.clone().into_backend(8010).name()
+                    svc_target.clone().into_backend(443).name(),
+                    svc_target.clone().into_backend(80).name()
                 ],
                 vec![],
             ),
@@ -850,12 +962,9 @@ mod test {
                 vec![
                     svc_target
                         .clone()
-                        .into_backend(8009)
+                        .into_backend(443)
                         .passthrough_route_name(),
-                    svc_target
-                        .clone()
-                        .into_backend(8010)
-                        .passthrough_route_name(),
+                    svc_target.clone().into_backend(80).passthrough_route_name(),
                 ],
                 vec![]
             ),
@@ -867,7 +976,11 @@ mod test {
     // routes that were already created.
     #[test]
     fn test_new_route_service_exists() {
-        let svc = clusterip_service("coolsvc", "prod", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service(
+            "coolsvc",
+            "prod",
+            &[("http", 80, 8009), ("https", 443, 8010)],
+        );
         let svc_ref = ObjectRef::from_obj(&svc);
         let svc_target = to_service_target(&svc_ref).unwrap();
 
@@ -897,8 +1010,8 @@ mod test {
             snapshot.updates_and_deletes(ResourceType::Cluster),
             (
                 vec![
-                    svc_target.clone().into_backend(8009).name(),
-                    svc_target.clone().into_backend(8010).name()
+                    svc_target.clone().into_backend(443).name(),
+                    svc_target.clone().into_backend(80).name()
                 ],
                 vec![],
             ),
@@ -911,12 +1024,9 @@ mod test {
                     svc_target.name(),
                     svc_target
                         .clone()
-                        .into_backend(8009)
+                        .into_backend(443)
                         .passthrough_route_name(),
-                    svc_target
-                        .clone()
-                        .into_backend(8010)
-                        .passthrough_route_name(),
+                    svc_target.clone().into_backend(80).passthrough_route_name(),
                 ],
                 vec![]
             ),
@@ -943,7 +1053,11 @@ mod test {
 
     #[test]
     fn test_delete_route_cluserip_service_exists() {
-        let svc = clusterip_service("prod", "coolsvc", &[("http", 8009), ("https", 8010)]);
+        let svc = clusterip_service(
+            "prod",
+            "coolsvc",
+            &[("http", 80, 8009), ("https", 443, 8010)],
+        );
         let svc_target = Target::kube_service("prod", "coolsvc").unwrap();
 
         test_delete_route(
@@ -954,12 +1068,9 @@ mod test {
                 svc_target.name(),
                 svc_target
                     .clone()
-                    .into_backend(8009)
+                    .into_backend(443)
                     .passthrough_route_name(),
-                svc_target
-                    .clone()
-                    .into_backend(8010)
-                    .passthrough_route_name(),
+                svc_target.clone().into_backend(80).passthrough_route_name(),
             ],
             // deleting the HTTProute should update the named listener
             vec![svc_target.name()],
@@ -1038,6 +1149,57 @@ mod test {
         )
     }
 
+    #[test]
+    fn test_cla() {
+        let svc = clusterip_service(
+            "prod",
+            "coolsvc",
+            &[("http", 80, 8009), ("https", 443, 8010)],
+        );
+        let slice1 = endpoint_slice(
+            &svc,
+            "coolsvc-slice1",
+            [("http", 8009), ("https", 8010)],
+            ["192.168.1.1", "192.168.1.2"],
+        );
+        let slice2 = endpoint_slice(
+            &svc,
+            "coolsvc-slice2",
+            [("http", 8009), ("https", 8010)],
+            ["192.168.1.3", "192.168.1.4"],
+        );
+        let svc_target = Target::kube_service("prod", "coolsvc").unwrap();
+        let svc_ref = ObjectRef::from_obj(&svc);
+
+        let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        insert(&mut svc_writer, svc.clone());
+
+        let (slice_store, mut slice_writer) = kube::runtime::reflector::store();
+        insert(&mut slice_writer, slice1.clone());
+        insert(&mut slice_writer, slice2.clone());
+
+        let mut index = IngestIndex::default();
+        index
+            .service_changed(&mut ResourceSnapshot::new(), &svc_store, &svc_ref)
+            .unwrap();
+
+        let mut snapshot = ResourceSnapshot::new();
+        index
+            .endpoints_changed(&mut snapshot, &svc_store, &slice_store, [&svc_ref])
+            .unwrap();
+
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::ClusterLoadAssignment),
+            (
+                vec![
+                    svc_target.clone().into_backend(443).name(),
+                    svc_target.clone().into_backend(80).name()
+                ],
+                vec![]
+            ),
+        );
+    }
+
     fn insert<K>(store: &mut kube::runtime::reflector::store::Writer<K>, object: K)
     where
         K: 'static + Lookup + Clone,
@@ -1060,10 +1222,53 @@ mod test {
             .unwrap()
     }
 
+    fn endpoint_slice(
+        svc: &Service,
+        slice_name: &'static str,
+        ports: impl IntoIterator<Item = (&'static str, u16)>,
+        addrs: impl IntoIterator<Item = &'static str>,
+    ) -> EndpointSlice {
+        let mut slice = EndpointSlice::default();
+        slice.meta_mut().namespace = svc.meta().namespace.clone();
+        slice.meta_mut().name = Some(slice_name.to_string());
+
+        // parent ref
+        slice.labels_mut().insert(
+            "kubernetes.io/service-name".to_string(),
+            svc.meta().name.clone().unwrap(),
+        );
+
+        slice.address_type = "IPv4".to_string();
+        for addr in addrs {
+            let endpoint = Endpoint {
+                addresses: vec![addr.to_string()],
+                conditions: Some(EndpointConditions {
+                    ready: Some(true),
+                    serving: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            slice.endpoints.push(endpoint);
+        }
+
+        for (name, port) in ports {
+            let endpoint_port = EndpointPort {
+                name: Some(name.to_string()),
+                port: Some(port as i32),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            };
+            slice.ports.get_or_insert_with(Vec::new).push(endpoint_port);
+        }
+
+        slice
+    }
+
     fn clusterip_service(
         namespace: &'static str,
         name: &'static str,
-        ports: &'static [(&'static str, u16)],
+        ports: &'static [(&'static str, u16, u16)],
     ) -> Service {
         let mut svc = Service::default();
         svc.meta_mut().name = Some(name.to_string());
@@ -1073,10 +1278,11 @@ mod test {
         spec.type_ = Some("ClusterIP".to_string());
 
         let mut svc_ports = vec![];
-        for &(name, port) in ports {
+        for &(name, port, target_port) in ports {
             svc_ports.push(ServicePort {
                 name: Some(name.to_string()),
                 port: port as i32,
+                target_port: Some(IntOrString::Int(target_port as i32)),
                 ..Default::default()
             });
         }
