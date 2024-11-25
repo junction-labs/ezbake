@@ -601,7 +601,7 @@ dependencies = [
  "crossbeam-skiplist",
  "enum-map",
  "futures",
- "h2 0.3.26",
+ "h2 0.4.7",
  "http 0.2.12",
  "junction-api",
  "k8s-openapi",
