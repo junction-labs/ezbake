@@ -27,7 +27,7 @@ tonic-reflection = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower = "0.4"
-tower-http = { version = "0.4", features = ["metrics", "trace"] }
+tower-http = { version = "0.6", features = ["metrics", "trace"] }
 xds-api = { version = "0.1", features = ["descriptor"] }
 
 # directly depend on k8s-openapi to specify the v1_xx feature
