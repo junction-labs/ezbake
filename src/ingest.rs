@@ -344,12 +344,12 @@ impl IngestIndex {
                     new_targets.insert(backend.id.clone());
 
                     // update the Cluster for this backend.
-                    let cluster = backend.to_xds_cluster();
+                    let cluster = backend.to_xds();
                     let xds = into_any!(cluster);
                     snapshot.insert_update(ResourceType::Cluster, cluster.name, xds);
 
                     // update the passthrough listener
-                    let listener = api_listener(backend.to_xds_passthrough_route());
+                    let listener = api_listener(backend.to_xds_lb_route_config());
                     let xds = into_any!(listener);
                     snapshot.insert_update(ResourceType::Listener, listener.name, xds);
                 }
@@ -388,7 +388,7 @@ impl IngestIndex {
                 // passthrough listeners
                 for target in &targets {
                     snapshot.insert_delete(ResourceType::Cluster, target.name());
-                    snapshot.insert_delete(ResourceType::Listener, target.passthrough_route_name());
+                    snapshot.insert_delete(ResourceType::Listener, target.lb_config_route_name());
                 }
 
                 // delete the implicit route if it exists
@@ -780,8 +780,8 @@ mod test {
             (
                 vec![
                     target.clone().into_vhost(None).name(),
-                    target.clone().into_backend(443).passthrough_route_name(),
-                    target.clone().into_backend(80).passthrough_route_name(),
+                    target.clone().into_backend(443).lb_config_route_name(),
+                    target.clone().into_backend(80).lb_config_route_name(),
                 ],
                 vec![]
             ),
@@ -821,8 +821,8 @@ mod test {
             (
                 vec![
                     target.clone().into_vhost(None).name(),
-                    target.clone().into_backend(443).passthrough_route_name(),
-                    target.clone().into_backend(80).passthrough_route_name(),
+                    target.clone().into_backend(443).lb_config_route_name(),
+                    target.clone().into_backend(80).lb_config_route_name(),
                 ],
                 vec![]
             ),
@@ -875,8 +875,8 @@ mod test {
                     svc_target
                         .clone()
                         .into_backend(443)
-                        .passthrough_route_name(),
-                    svc_target.clone().into_backend(80).passthrough_route_name(),
+                        .lb_config_route_name(),
+                    svc_target.clone().into_backend(80).lb_config_route_name(),
                 ],
             ),
             "service should delete LB passthrough listeners and the default listener",
@@ -963,8 +963,8 @@ mod test {
                     svc_target
                         .clone()
                         .into_backend(443)
-                        .passthrough_route_name(),
-                    svc_target.clone().into_backend(80).passthrough_route_name(),
+                        .lb_config_route_name(),
+                    svc_target.clone().into_backend(80).lb_config_route_name(),
                 ],
                 vec![]
             ),
@@ -1025,8 +1025,8 @@ mod test {
                     svc_target
                         .clone()
                         .into_backend(443)
-                        .passthrough_route_name(),
-                    svc_target.clone().into_backend(80).passthrough_route_name(),
+                        .lb_config_route_name(),
+                    svc_target.clone().into_backend(80).lb_config_route_name(),
                 ],
                 vec![]
             ),
@@ -1069,8 +1069,8 @@ mod test {
                 svc_target
                     .clone()
                     .into_backend(443)
-                    .passthrough_route_name(),
-                svc_target.clone().into_backend(80).passthrough_route_name(),
+                    .lb_config_route_name(),
+                svc_target.clone().into_backend(80).lb_config_route_name(),
             ],
             // deleting the HTTProute should update the named listener
             vec![svc_target.name()],
@@ -1091,8 +1091,8 @@ mod test {
                 svc_target
                     .clone()
                     .into_backend(443)
-                    .passthrough_route_name(),
-                svc_target.clone().into_backend(80).passthrough_route_name(),
+                    .lb_config_route_name(),
+                svc_target.clone().into_backend(80).lb_config_route_name(),
             ],
             // deleting the HTTProute should update the named listener
             vec![svc_target.name()],
