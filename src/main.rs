@@ -1,6 +1,7 @@
 use std::{future::Future, time::Duration};
 
 use clap::{Args, Parser};
+use ingest::IngestIndex;
 use junction_api::kube::k8s_openapi::{
     self,
     api::{core::v1::Service, discovery::v1::EndpointSlice},
@@ -81,9 +82,11 @@ async fn main() {
     }
 
     let client = kube::Client::try_default().await.unwrap();
-    let (cache, writer) = xds::snapshot();
+    let index = crate::ingest::index();
+    let (cache, writer) = xds::snapshot(index.cache_callbacks());
 
     let ingest = ingest(
+        index,
         &client,
         args.namespace_args.all_namespaces,
         args.namespace_args.namespace.as_deref(),
@@ -198,6 +201,7 @@ async fn serve(addr: &str, cache: xds::SnapshotCache) -> anyhow::Result<()> {
 }
 
 async fn ingest(
+    index: IngestIndex,
     client: &kube::Client,
     all_namespaces: bool,
     namespace: Option<&str>,
@@ -232,7 +236,13 @@ async fn ingest(
     );
 
     // ingest::run should
-    tokio::spawn(ingest::run(writer, svc_watch, route_watch, slice_watch));
+    tokio::spawn(ingest::run(
+        index,
+        writer,
+        svc_watch,
+        route_watch,
+        slice_watch,
+    ));
     tokio::try_join!(
         spawn_watch(run_route_watch),
         spawn_watch(run_slice_watch),
