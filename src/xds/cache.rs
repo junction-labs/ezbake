@@ -115,13 +115,6 @@ impl ResourceVersion {
         Self(version.try_into().expect("masked a zero ResourceVersion"))
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_parts(prefix: u64, epoch_ms: u64) -> Self {
-        let prefix = prefix << 48;
-        let version = prefix | (epoch_ms & Self::EPOCH_MASK);
-        Self(version.try_into().expect("created a zero ResourceVersion"))
-    }
-
     fn as_parts(&self) -> (u64, u64) {
         let v = self.0.get();
         let prefix = (v & ResourceVersion::PREFIX_MASK) >> 48;
@@ -235,11 +228,33 @@ impl std::fmt::Debug for VersionedProto {
     }
 }
 
+pub(crate) trait SnapshotCallback {
+    fn call(&self, writer: SnapshotWriter, resource_type: ResourceType, resource_name: &str);
+}
+
 /// Create a new [SnapshotCache] and a paired [SnapshotWriter]. The writer is
 /// the only way to safely write to this cache - don't drop it if you need to
 /// write.
-pub(crate) fn snapshot() -> (SnapshotCache, SnapshotWriter) {
-    let inner = Arc::new(SnapshotCacheInner::default());
+pub(crate) fn snapshot(
+    resource_callbacks: impl IntoIterator<
+        Item = (ResourceType, Box<dyn SnapshotCallback + Send + Sync>),
+    >,
+) -> (SnapshotCache, SnapshotWriter) {
+    let mut callbacks = EnumMap::default();
+    for (rtype, cb) in resource_callbacks {
+        callbacks[rtype] = Some(cb)
+    }
+
+    let inner = Arc::new(SnapshotCacheInner {
+        version: VersionCounter::with_process_prefix(),
+        typed: Default::default(),
+        callbacks,
+        // 12 = 3 cache updates for each of 4 types of resource type.
+        //
+        // this is completely arbitrary.
+        notifications: broadcast::Sender::new(12),
+    });
+
     (
         SnapshotCache {
             inner: inner.clone(),
@@ -259,20 +274,10 @@ pub(crate) struct SnapshotCache {
 }
 
 struct SnapshotCacheInner {
+    version: VersionCounter,
     typed: EnumMap<ResourceType, ResourceCache>,
+    callbacks: EnumMap<ResourceType, Option<Box<dyn SnapshotCallback + Send + Sync>>>,
     notifications: broadcast::Sender<ResourceType>,
-}
-
-impl Default for SnapshotCacheInner {
-    fn default() -> Self {
-        Self {
-            typed: Default::default(),
-            // 12 = 3 cache updates for each of 4 types of resource type.
-            //
-            // this is completely arbitrary.
-            notifications: broadcast::Sender::new(12),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -290,6 +295,21 @@ impl SnapshotCache {
     }
 
     pub fn get(&self, resource_type: ResourceType, resource_name: &str) -> Option<Entry> {
+        // fast path: resource exists
+        if let Some(e) = self.inner.typed[resource_type].resources.get(resource_name) {
+            return Some(e);
+        }
+
+        // slow path: try to compute the resource, allow updating the cache in the callback.
+        if let Some(cb) = &self.inner.callbacks[resource_type] {
+            cb.call(
+                SnapshotWriter {
+                    inner: self.inner.clone(),
+                },
+                resource_type,
+                resource_name,
+            )
+        }
         self.inner.typed[resource_type].resources.get(resource_name)
     }
 
@@ -349,7 +369,9 @@ pub(crate) struct SnapshotWriter {
 }
 
 impl SnapshotWriter {
-    pub(crate) fn update(&mut self, version: ResourceVersion, snapshot: ResourceSnapshot) {
+    pub(crate) fn update(&mut self, snapshot: ResourceSnapshot) -> ResourceVersion {
+        let version = self.inner.version.next();
+
         for (resource_type, updates) in snapshot.resources {
             let cache = &self.inner.typed[resource_type];
 
@@ -377,5 +399,21 @@ impl SnapshotWriter {
                 let _ = self.inner.notifications.send(resource_type);
             }
         }
+
+        version
     }
+}
+
+#[cfg(test)]
+mod test {
+    use super::SnapshotCache;
+
+    #[test]
+    fn assert_cache_send_sync() {
+        assert_send::<SnapshotCache>();
+        assert_sync::<SnapshotCache>();
+    }
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
 }
