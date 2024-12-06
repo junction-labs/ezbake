@@ -872,10 +872,7 @@ mod test {
                 vec![],
                 vec![
                     svc_target.clone().into_vhost(None).name(),
-                    svc_target
-                        .clone()
-                        .into_backend(443)
-                        .lb_config_route_name(),
+                    svc_target.clone().into_backend(443).lb_config_route_name(),
                     svc_target.clone().into_backend(80).lb_config_route_name(),
                 ],
             ),
@@ -960,10 +957,7 @@ mod test {
             snapshot.updates_and_deletes(ResourceType::Listener),
             (
                 vec![
-                    svc_target
-                        .clone()
-                        .into_backend(443)
-                        .lb_config_route_name(),
+                    svc_target.clone().into_backend(443).lb_config_route_name(),
                     svc_target.clone().into_backend(80).lb_config_route_name(),
                 ],
                 vec![]
@@ -1022,10 +1016,7 @@ mod test {
             (
                 vec![
                     svc_target.name(),
-                    svc_target
-                        .clone()
-                        .into_backend(443)
-                        .lb_config_route_name(),
+                    svc_target.clone().into_backend(443).lb_config_route_name(),
                     svc_target.clone().into_backend(80).lb_config_route_name(),
                 ],
                 vec![]
@@ -1066,10 +1057,7 @@ mod test {
             // initial update should create HTTPRoute listener and config listeners
             vec![
                 svc_target.name(),
-                svc_target
-                    .clone()
-                    .into_backend(443)
-                    .lb_config_route_name(),
+                svc_target.clone().into_backend(443).lb_config_route_name(),
                 svc_target.clone().into_backend(80).lb_config_route_name(),
             ],
             // deleting the HTTProute should update the named listener
@@ -1088,10 +1076,7 @@ mod test {
             // initial update should create HTTPRoute listener and config listeners
             vec![
                 svc_target.name(),
-                svc_target
-                    .clone()
-                    .into_backend(443)
-                    .lb_config_route_name(),
+                svc_target.clone().into_backend(443).lb_config_route_name(),
                 svc_target.clone().into_backend(80).lb_config_route_name(),
             ],
             // deleting the HTTProute should update the named listener

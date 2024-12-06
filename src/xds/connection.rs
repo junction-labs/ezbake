@@ -84,7 +84,7 @@ pub(crate) struct ConnectionSnapshotEntry<'a>(
     crossbeam_skiplist::map::Entry<'a, ConnectionSnapshotKey, AdsConnectionInfo>,
 );
 
-impl<'a> ConnectionSnapshotEntry<'a> {
+impl ConnectionSnapshotEntry<'_> {
     pub(crate) fn node(&self) -> &xds_node::Node {
         &self.0.value().node
     }
@@ -446,7 +446,7 @@ enum SnapshotIter<'n, 's> {
     ),
 }
 
-impl<'n, 's> Iterator for SnapshotIter<'n, 's> {
+impl<'s> Iterator for SnapshotIter<'_, 's> {
     type Item = crate::xds::cache::Entry<'s>;
 
     #[allow(clippy::while_let_on_iterator)]
