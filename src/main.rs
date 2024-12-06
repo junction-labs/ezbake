@@ -91,10 +91,34 @@ async fn main() {
     );
     let serve = serve(&args.listen_addr, cache);
 
-    if let Err(e) = tokio::try_join!(ingest, serve) {
-        tracing::error!(err = ?e, "exiting: {e}");
-        std::process::exit(1);
+    std::process::exit(tokio::select! {
+        biased;
+        res = ingest => {
+            tracing::error!(err = ?res, "ingest exited unexpectedly");
+            1
+        },
+        res = serve => {
+            tracing::error!(err = ?res, "server exited unexpectedly");
+            2
+        }
+        _ = handle_signals() => 0,
+    })
+}
+
+async fn handle_signals() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // is this awkward to write out? yes. is this better than the equivalent
+    // with futures::future::select_all? also yes.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    tokio::select! {
+        _ = sigterm.recv() => (),
+        _ = sigint.recv() => (),
     }
+
+    Ok(())
 }
 
 /// Set up a tracing exporter.
