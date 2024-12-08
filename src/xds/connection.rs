@@ -467,7 +467,7 @@ impl<'s> Iterator for SnapshotIter<'_, 's> {
 
 #[cfg(test)]
 mod test {
-    use crate::xds::cache::ResourceVersion;
+
     use crate::xds::{ResourceSnapshot, SnapshotWriter};
 
     use super::*;
@@ -1090,7 +1090,7 @@ mod test {
             "some-endpoints".to_string(),
             anything(),
         );
-        writer.update(ResourceVersion::from_parts(0xBEEF, 124), snapshot);
+        writer.update(snapshot);
 
         // when the client ACKs the first response, it shouldn't change the state of the connection
         let (_, resp) = conn
@@ -1134,9 +1134,8 @@ mod test {
             }
         }
 
-        let version = ResourceVersion::from_parts(0xBEEF, max_version);
-        let (cache, mut writer) = crate::xds::snapshot();
-        writer.update(version, snapshot);
+        let (cache, mut writer) = crate::xds::snapshot([]);
+        writer.update(snapshot);
 
         (cache, writer)
     }

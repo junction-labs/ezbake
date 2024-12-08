@@ -1,23 +1,25 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
+    str::FromStr,
     sync::Arc,
 };
 
-use junction_api::kube::{gateway_api, k8s_openapi};
-use junction_api::{BackendId, VirtualHost};
+use crossbeam_skiplist::SkipMap;
+use junction_api::{backend::Backend, http::Route};
+use junction_api::{backend::BackendId, Service};
+use junction_api::{
+    http::HostnameMatch,
+    kube::{gateway_api, k8s_openapi},
+    Name,
+};
 
 use gateway_api::apis::experimental::httproutes::HTTPRoute;
-use junction_api::{backend::Backend, http::Route, Target};
 use k8s_openapi::{
-    api::{
-        core::v1::Service,
-        discovery::v1::{Endpoint, EndpointSlice},
-    },
+    api::{core::v1 as core_v1, discovery::v1 as discovery_v1},
     apimachinery::pkg::util::intstr::IntOrString,
 };
 use kube::runtime::reflector::{ObjectRef, Store};
-
 use tracing::{debug, info, trace, warn};
 use xds_api::pb::{
     envoy::{
@@ -38,7 +40,7 @@ use xds_api::pb::{
 use crate::{
     k8s::{ChangedObjects, KubeResource, RefAndParents, Watch},
     metrics::scoped_timer,
-    xds::{ResourceSnapshot, ResourceType, SnapshotWriter, VersionCounter},
+    xds::{ResourceSnapshot, ResourceType, SnapshotWriter},
 };
 
 /// Shorthand for `protobuf::Any::from_msg(val).expect("...")` with a standard
@@ -61,40 +63,40 @@ enum IngestError {
     InvalidConfig(#[from] junction_api::Error),
 }
 
-/// Create a ServiceTarget with no ports from a Serivce
-fn to_service_target(obj_ref: &ObjectRef<Service>) -> Result<Target, IngestError> {
-    let namespace = obj_ref
+fn kube_svc_from(svc_ref: &ObjectRef<core_v1::Service>) -> Result<Service, IngestError> {
+    let namespace = svc_ref
         .namespace
         .as_deref()
         .ok_or_else(|| IngestError::InvalidObject {
-            obj_ref: obj_ref.to_string(),
+            obj_ref: svc_ref.to_string(),
             message: "missing namespace".to_string(),
         })?;
 
-    Ok(Target::kube_service(namespace, &obj_ref.name)?)
+    Ok(Service::kube(namespace, &svc_ref.name)?)
+}
+
+pub(crate) fn index() -> IngestIndex {
+    IngestIndex::default()
 }
 
 pub(crate) async fn run(
+    index: IngestIndex,
     snapshot_writer: SnapshotWriter,
-    services: Watch<Service>,
+    services: Watch<core_v1::Service>,
     routes: Watch<HTTPRoute>,
-    slices: Watch<EndpointSlice>,
+    slices: Watch<discovery_v1::EndpointSlice>,
 ) -> Infallible {
     let watches = Watches {
         services,
         routes,
         slices,
     };
-    let version_counter = VersionCounter::with_process_prefix();
-    let index = IngestIndex::default();
-
-    run_with(snapshot_writer, watches, version_counter, index).await
+    run_with(snapshot_writer, watches, index).await
 }
 
 async fn run_with(
     mut snapshot_writer: SnapshotWriter,
     watches: Watches,
-    version_counter: VersionCounter,
     mut index: IngestIndex,
 ) -> Infallible {
     let mut svcs = watches.services.changes.subscribe();
@@ -107,9 +109,8 @@ async fn run_with(
                 if let Ok(svcs) = svcs {
                     batch_snapshot(
                         &mut snapshot_writer,
-                        &version_counter,
                         svcs,
-                        |snapshot, svc| { index.service_changed(snapshot, &watches.services.store, svc) },
+                        |snapshot, svc| { index.service_changed(snapshot, &watches.services.store, &watches.slices.store, svc) },
                     );
                 }
             }
@@ -117,9 +118,8 @@ async fn run_with(
                 if let Ok(routes) = routes {
                     batch_snapshot(
                         &mut snapshot_writer,
-                        &version_counter,
                         routes,
-                        |snapshot, route| { index.httproute_changed(snapshot, &watches.routes.store, &watches.services.store, route) },
+                        |snapshot, route| { index.httproute_changed(snapshot, &watches.routes.store, route) },
                     );
                 }
             }
@@ -127,7 +127,6 @@ async fn run_with(
                 if let Ok(slices) = slices {
                     compute_snapshot(
                         &mut snapshot_writer,
-                        &version_counter,
                         slices,
                         |snapshot, slices| {
                             let slice_svcs = endpoint_slice_services(&*slices);
@@ -145,12 +144,8 @@ async fn run_with(
     }
 }
 
-fn batch_snapshot<K, F>(
-    writer: &mut SnapshotWriter,
-    version_counter: &VersionCounter,
-    changed_objects: ChangedObjects<K>,
-    mut f: F,
-) where
+fn batch_snapshot<K, F>(writer: &mut SnapshotWriter, changed_objects: ChangedObjects<K>, mut f: F)
+where
     K: KubeResource,
     F: FnMut(&mut ResourceSnapshot, &ObjectRef<K>) -> Result<(), IngestError>,
 {
@@ -167,15 +162,11 @@ fn batch_snapshot<K, F>(
         }
     }
 
-    write_snapshot(writer, version_counter, snapshot);
+    write_snapshot(writer, snapshot);
 }
 
-fn compute_snapshot<K, F>(
-    writer: &mut SnapshotWriter,
-    version_counter: &VersionCounter,
-    changed_objects: ChangedObjects<K>,
-    mut f: F,
-) where
+fn compute_snapshot<K, F>(writer: &mut SnapshotWriter, changed_objects: ChangedObjects<K>, mut f: F)
+where
     K: KubeResource,
     F: FnMut(&mut ResourceSnapshot, ChangedObjects<K>) -> Result<(), Vec<IngestError>>,
 {
@@ -188,21 +179,17 @@ fn compute_snapshot<K, F>(
         }
     }
 
-    write_snapshot(writer, version_counter, snapshot);
+    write_snapshot(writer, snapshot);
 }
 
-fn write_snapshot(
-    writer: &mut SnapshotWriter,
-    version_counter: &VersionCounter,
-    snapshot: ResourceSnapshot,
-) {
+fn write_snapshot(writer: &mut SnapshotWriter, snapshot: ResourceSnapshot) {
     if snapshot.is_empty() {
         return;
     }
 
-    let version = version_counter.next();
     let updates = snapshot.update_counts();
     let deletes = snapshot.delete_counts();
+    let version = writer.update(snapshot);
     debug!(
         version = %version,
         // NOTE: updates/deletes are going to serialize as a janky debug string
@@ -214,12 +201,11 @@ fn write_snapshot(
         ?deletes,
         "updated snapshot"
     );
-    writer.update(version, snapshot);
 }
 
 fn endpoint_slice_services<'a>(
-    slices: impl IntoIterator<Item = &'a RefAndParents<EndpointSlice>>,
-) -> HashSet<ObjectRef<Service>> {
+    slices: impl IntoIterator<Item = &'a RefAndParents<discovery_v1::EndpointSlice>>,
+) -> HashSet<ObjectRef<core_v1::Service>> {
     let mut parents = HashSet::new();
     for slice in slices {
         parents.extend(slice.parents.iter().cloned());
@@ -228,29 +214,138 @@ fn endpoint_slice_services<'a>(
 }
 
 struct Watches {
-    services: Watch<Service>,
+    services: Watch<core_v1::Service>,
     routes: Watch<HTTPRoute>,
-    slices: Watch<EndpointSlice>,
+    slices: Watch<discovery_v1::EndpointSlice>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RouteIndex {
+    inner: Arc<RouteIndexInner>,
 }
 
 #[derive(Debug, Default)]
-struct IngestIndex {
-    // track the mapping between HTTPRoutes and the Routes they generate for deletes
-    route_targets: HashMap<ObjectRef<HTTPRoute>, VirtualHost>,
-    // an inverted index from vhost to the service that it's an implicit route for.
-    implicit_targets: HashMap<VirtualHost, ObjectRef<Service>>,
+struct RouteIndexInner {
+    explicit: SkipMap<Name, (Vec<HostnameMatch>, Vec<u16>)>,
+    implicit: SkipMap<Name, (Vec<HostnameMatch>, Vec<u16>)>,
+}
+
+impl crate::xds::SnapshotCallback for RouteIndex {
+    fn call(&self, mut writer: SnapshotWriter, resource_type: ResourceType, resource_name: &str) {
+        if resource_type != ResourceType::Listener {
+            return;
+        }
+
+        // parse (hostname, port) out of the resource name
+        let Some((hostname, port)) = resource_name.split_once(':') else {
+            return;
+        };
+        let Ok(port) = port.parse() else {
+            return;
+        };
+
+        if let Some(route_name) = self.lookup(hostname, port) {
+            let mut snapshot = ResourceSnapshot::new();
+            let listener = rds_listener(resource_name.to_string(), route_name.to_string());
+            let xds = into_any!(listener);
+            snapshot.insert_update(ResourceType::Listener, listener.name, xds);
+            let _ = writer.update(snapshot);
+        }
+    }
+}
+
+impl RouteIndex {
+    fn add_explicit(&self, route: &Route) {
+        let hostnames = route.hostnames.clone();
+        let ports = route.ports.clone();
+
+        self.inner
+            .explicit
+            .insert(route.id.clone(), (hostnames, ports));
+    }
+
+    fn add_implicit(&self, route: &Route) {
+        let hostnames = route.hostnames.clone();
+        let ports = route.ports.clone();
+
+        self.inner
+            .implicit
+            .insert(route.id.clone(), (hostnames, ports));
+    }
+
+    fn remove(&self, name: &Name) {
+        // TODO: this could be separated, but keep things together
+        // for the moment to make life easy.
+
+        self.inner.explicit.remove(name);
+        self.inner.implicit.remove(name);
+    }
+
+    fn lookup(&self, hostname: &str, port: u16) -> Option<Name> {
+        // this is an extremely inefficient linear scan of all of the
+        // existing routes. this is fine for ezbake, since we expect to
+        // have ~tens of routes, maybe hundreds.
+
+        // walk explicit routes first
+        for entry in self.inner.explicit.iter() {
+            let (hostnames, ports) = entry.value();
+            // check port match first, it's ez
+            if !(ports.is_empty() || ports.contains(&port)) {
+                continue;
+            }
+
+            if !hostnames.iter().any(|h| h.matches_str(hostname)) {
+                continue;
+            }
+
+            return Some(entry.key().clone());
+        }
+
+        // walk implicit routes next
+        for entry in self.inner.implicit.iter() {
+            let (hostnames, ports) = entry.value();
+            // check port match first, it's ez
+            if !(ports.is_empty() || ports.contains(&port)) {
+                continue;
+            }
+
+            if !hostnames.iter().any(|h| h.matches_str(hostname)) {
+                continue;
+            }
+
+            return Some(entry.key().clone());
+        }
+
+        // ope nada
+        None
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct IngestIndex {
     // an index of Service to [BackendId], updated every time a Service is seen.
     // tracked so that on update its possible to know which Backends to remove.
-    service_targets: HashMap<ObjectRef<Service>, HashSet<BackendId>>,
+    service_backends: HashMap<ObjectRef<core_v1::Service>, HashSet<BackendId>>,
+
     // an index tracking which CLAs we've generated for a Service. this has to
     // be tracked independently of service_targets because while kube SHOULD
     // guarantee that they match, we get the information about creates/deletes
     // at separate times and have to keep the world sane on our own.
-    cla_targets: HashMap<ObjectRef<Service>, HashSet<BackendId>>,
-    // the set of Routes created by Services
-    implicit_routes: BTreeSet<VirtualHost>,
-    // the set of Routes created by HTTPRoutes
-    explicit_routes: BTreeSet<VirtualHost>,
+    cla_backends: HashMap<ObjectRef<core_v1::Service>, HashSet<BackendId>>,
+
+    // a route/hostname index for all implicit and explicit routes
+    routes: RouteIndex,
+}
+
+impl IngestIndex {
+    pub(crate) fn cache_callbacks(
+        &self,
+    ) -> Vec<(
+        ResourceType,
+        Box<dyn crate::xds::SnapshotCallback + Send + Sync>,
+    )> {
+        vec![(ResourceType::Listener, Box::new(self.routes.clone()))]
+    }
 }
 
 impl IngestIndex {
@@ -268,52 +363,26 @@ impl IngestIndex {
         &mut self,
         snapshot: &mut ResourceSnapshot,
         routes: &Store<HTTPRoute>,
-        services: &Store<Service>,
         route_ref: &ObjectRef<HTTPRoute>,
     ) -> Result<(), IngestError> {
         match routes.get(route_ref) {
             Some(http_route) => {
                 let route = Route::from_gateway_httproute(&http_route)?;
-                let listener = api_listener(route.to_xds());
-                let xds = into_any!(listener);
+                self.routes.add_explicit(&route);
 
-                snapshot.insert_update(ResourceType::Listener, listener.name, xds);
-                self.implicit_routes.remove(&route.vhost);
-                self.explicit_routes.insert(route.vhost.clone());
+                // TODO: if the Route has ports and explicit hostnames, we
+                // can generate listeners for them ahead of time. don't bother yet.
 
-                let old_target = self
-                    .route_targets
-                    .insert(route_ref.clone(), route.vhost.clone());
-
-                match old_target {
-                    Some(old_target) if old_target != route.vhost => {
-                        snapshot.insert_delete(ResourceType::Listener, old_target.name());
-                        self.explicit_routes.remove(&old_target);
-                    }
-                    _ => (),
-                }
+                let xds_route = route.to_xds();
+                let xds = into_any!(xds_route);
+                snapshot.insert_update(ResourceType::RouteConfiguration, xds_route.name, xds);
             }
             None => {
-                if let Some(vhost) = self.route_targets.remove(route_ref) {
-                    snapshot.insert_delete(ResourceType::Listener, vhost.name());
-                    self.explicit_routes.remove(&vhost);
-
-                    // if this vhost maps back to a service and that service
-                    // exists right now, create a Route for it.
-                    if let Some(svc_ref) = self.implicit_targets.get(&vhost) {
-                        if let Some(svc) = services.get(svc_ref) {
-                            let backends = Backend::from_service(&svc).unwrap();
-                            let vhost = implicit_vhost(svc_ref, &backends)?;
-
-                            let route = implicit_route(&vhost.target);
-                            let listener = api_listener(route.to_xds());
-                            let xds = into_any!(listener);
-
-                            self.implicit_routes.insert(vhost.clone());
-                            snapshot.insert_update(ResourceType::Listener, listener.name, xds);
-                        }
-                    }
-                }
+                // FIXME: we're using just the HTTPRoute name as the Route ID which seems terrible?
+                let route_name = Name::from_str(&route_ref.name).expect(
+                    "a valid Kubernetes name should be a valid name. this is a bug in Junction",
+                );
+                self.routes.remove(&route_name);
             }
         }
 
@@ -327,17 +396,27 @@ impl IngestIndex {
     ///
     /// Make sure there's a Route pointing to this Service. If one has already
     /// been created by an HTTPRoute, do nothing.
+    ///
+    /// Returns `true` if this Service is newly created, so that we can re-trigger
+    /// an endpointSlice update.
     fn service_changed(
         &mut self,
         snapshot: &mut ResourceSnapshot,
-        store: &Store<Service>,
-        svc_ref: &ObjectRef<Service>,
+        svc_store: &Store<core_v1::Service>,
+        slice_store: &Store<discovery_v1::EndpointSlice>,
+        svc_ref: &ObjectRef<core_v1::Service>,
     ) -> Result<(), IngestError> {
-        match store.get(svc_ref).as_ref() {
+        let mut created = false;
+
+        match svc_store.get(svc_ref).as_ref() {
             Some(svc) => {
                 let backends = Backend::from_service(svc)?;
-                let mut old_targets = self.service_targets.remove(svc_ref).unwrap_or_default();
+                let mut old_targets = self.service_backends.remove(svc_ref).unwrap_or_default();
                 let mut new_targets = HashSet::with_capacity(backends.len());
+
+                if old_targets.is_empty() {
+                    created = true;
+                }
 
                 for backend in &backends {
                     old_targets.remove(&backend.id);
@@ -348,8 +427,8 @@ impl IngestIndex {
                     let xds = into_any!(cluster);
                     snapshot.insert_update(ResourceType::Cluster, cluster.name, xds);
 
-                    // update the passthrough listener
-                    let listener = api_listener(backend.to_xds_lb_route_config());
+                    // update the lb config listener
+                    let listener = route_listener(backend.to_xds_lb_route_config());
                     let xds = into_any!(listener);
                     snapshot.insert_update(ResourceType::Listener, listener.name, xds);
                 }
@@ -359,30 +438,23 @@ impl IngestIndex {
                     snapshot.insert_delete(ResourceType::Cluster, target.name());
                 }
                 if !new_targets.is_empty() {
-                    self.service_targets.insert(svc_ref.clone(), new_targets);
+                    self.service_backends.insert(svc_ref.clone(), new_targets);
                 }
 
-                // if an explicit route hasn't been created for this service,
-                // create an implicit route
+                // create an implicit route and add it to the index.
                 //
-                // TODO: why isn't this tracked in the service_targets index?
-                // should it be?  that would make deletes easier, and would mean
-                // we can ditch to_service_target(...) here.
-                let implicit_vhost = implicit_vhost(svc_ref, &backends)?;
-                if !self.explicit_routes.contains(&implicit_vhost) {
-                    let route = implicit_route(&implicit_vhost.target);
-                    let listener = api_listener(route.to_xds());
-                    let xds = into_any!(listener);
+                // as soon as it's been added, convert to xds and shove it into the
+                // snapshot update.
+                let implicit_route = implicit_route(svc_ref);
+                self.routes.add_implicit(&implicit_route);
 
-                    snapshot.insert_update(ResourceType::Listener, listener.name, xds);
-                    self.implicit_routes.insert(implicit_vhost.clone());
-                    self.implicit_targets
-                        .insert(implicit_vhost, svc_ref.clone());
-                }
+                let implicit_route = implicit_route.to_xds();
+                let xds = into_any!(implicit_route);
+                snapshot.insert_update(ResourceType::RouteConfiguration, implicit_route.name, xds);
             }
             None => {
                 // remove the svc from the index
-                let targets = self.service_targets.remove(svc_ref).unwrap_or_default();
+                let targets = self.service_backends.remove(svc_ref).unwrap_or_default();
 
                 // delete all of the Clusters for those targets and all of the
                 // passthrough listeners
@@ -391,22 +463,27 @@ impl IngestIndex {
                     snapshot.insert_delete(ResourceType::Listener, target.lb_config_route_name());
                 }
 
-                // delete the implicit route if it exists
-                let implicit_vhost = to_service_target(svc_ref)?.into_vhost(None);
-                let removed = self.implicit_routes.remove(&implicit_vhost)
-                    || self.implicit_targets.remove(&implicit_vhost).is_some();
-                if removed {
-                    snapshot.insert_delete(ResourceType::Listener, implicit_vhost.name());
-                }
+                let route_name = implicit_route_name(svc_ref);
+                self.routes.remove(&route_name);
+                snapshot.insert_delete(ResourceType::RouteConfiguration, route_name.to_string());
+            }
+        }
+
+        // update endpoints if it looks like we went from nothign to something, to
+        // deal with the fact that
+        if created {
+            if let Err(errs) = self.endpoints_changed(snapshot, svc_store, slice_store, [svc_ref]) {
+                // safety: endpoints_changed should never return an empty list of errors
+                return Err(errs.into_iter().next().unwrap());
             }
         }
 
         Ok(())
     }
 
-    // Triggered when 1 or more services have their EndpointSlices changed.
-    // Groups all endpoint slices by services, and then recomputes CLAs for
-    // changed services.
+    // Triggered when 1 or more services have their EndpointSlices changed or
+    // when a Service is created. Groups all endpoint slices by services, and
+    // then recomputes CLAs for changed services.
     //
     // This is almost certainly less efficient than keeping an index of Service
     // to EndpointSlice ourselves and recomputing that way - if you're back here
@@ -415,20 +492,20 @@ impl IngestIndex {
     // This function expects something else to do the mapping from EndpointSlice
     // to Service.
     //
-    // FIXME: there's a race here - the Services every EndpointSlice is attached to
-    // need to exist before we can actual calculate CLAs because that requires the
-    // reverse mapping from `targetPort` back to `port`. On the rare occasion we
-    // lose the race, there should be some way to infer the mapping (or assume that
-    // port == targetPort) and then recompute everything when the Service appears.
+    // There's a race here - the Services every EndpointSlice is attached to
+    // need to exist before we can actual calculate CLAs because that requires
+    // the reverse mapping from `targetPort` back to `port`. Because of this,
+    // services_changed calls endpoints_changed every time a service is created
+    // from nothing.
     fn endpoints_changed<'a, I>(
         &mut self,
         snapshot: &mut ResourceSnapshot,
-        svc_store: &Store<Service>,
-        slice_store: &Store<EndpointSlice>,
+        svc_store: &Store<core_v1::Service>,
+        slice_store: &Store<discovery_v1::EndpointSlice>,
         services: I,
     ) -> Result<(), Vec<IngestError>>
     where
-        I: IntoIterator<Item = &'a ObjectRef<Service>>,
+        I: IntoIterator<Item = &'a ObjectRef<core_v1::Service>>,
     {
         let mut svc_slices: HashMap<_, _> = services
             .into_iter()
@@ -458,12 +535,12 @@ impl IngestIndex {
                 }
             };
 
-            let Ok(target) = to_service_target(svc_ref) else {
+            let Ok(target) = kube_svc_from(svc_ref) else {
                 continue;
             };
 
             let mut new_targets = HashSet::new();
-            let mut old_targets = self.cla_targets.remove(svc_ref).unwrap_or_default();
+            let mut old_targets = self.cla_backends.remove(svc_ref).unwrap_or_default();
 
             for (target, cla) in build_clas(&target, &port_lookup, slices.iter().map(Arc::as_ref)) {
                 let xds = into_any!(cla);
@@ -485,46 +562,81 @@ impl IngestIndex {
     }
 }
 
-fn implicit_vhost(
-    svc_ref: &ObjectRef<Service>,
-    backends: &[Backend],
-) -> Result<VirtualHost, IngestError> {
-    match backends {
-        [] => Err(IngestError::InvalidObject {
-            obj_ref: svc_ref.to_string(),
-            message: "Service has no backends".to_string(),
-        }),
-        [backend] => Ok(backend.id.target.clone().into_vhost(None)),
-        [first, rest @ ..] => {
-            for backend in rest {
-                if backend.id.target != first.id.target {
-                    return Err(IngestError::InvalidObject {
-                        obj_ref: svc_ref.to_string(),
-                        message: "Service backends have more than one Target".to_string(),
-                    });
-                }
-            }
-            Ok(first.id.target.clone().into_vhost(None))
-        }
-    }
+// NOTE: this must be the same as implicit_route
+fn implicit_route_name(svc_ref: &ObjectRef<core_v1::Service>) -> Name {
+    let namespace = svc_ref.namespace.as_deref().unwrap_or_default();
+    let name = &svc_ref.name;
+
+    Name::from_str(&format!("ezbi-{namespace}-{name}"))
+        .expect("generated an invalid implicit route")
 }
 
 // a passthrough route that forces a port
-fn implicit_route(target: &Target) -> Route {
-    let vhost = target.clone().into_vhost(None);
+fn implicit_route(svc_ref: &ObjectRef<core_v1::Service>) -> Route {
+    // safety: these are kube names, if they're not valid or there's
+    // no namespace that's a wild bug.
+    //
+    // in some future these should be validated way earlier.
+    //
+    // NOTE: this must be the same as implicit_route_name
+    let namespace = svc_ref.namespace.as_deref().unwrap_or_default();
+    let name = &svc_ref.name;
+    let route_name = Name::from_str(&format!("ezbi-{namespace}-{name}"))
+        .expect("generated an invalid implicit route");
+    let svc = Service::kube(namespace, name).unwrap();
 
-    let mut route = Route::passthrough_route(vhost);
-    route.tags = BTreeMap::from_iter([(
-        junction_api::http::tags::GENERATED_BY.to_string(),
-        "ezbake".to_string(),
-    )]);
+    let mut route = Route::passthrough_route(route_name, svc);
+    route.tags = BTreeMap::from_iter([
+        (
+            junction_api::http::tags::GENERATED_BY.to_string(),
+            "ezbake".to_string(),
+        ),
+        ("ezbake/namespace".to_string(), namespace.to_string()),
+        ("ezbake/name".to_string(), name.to_string()),
+    ]);
 
     route
 }
 
+fn rds_listener(name: String, rds: String) -> xds_listener::Listener {
+    use xds_http::http_connection_manager::RouteSpecifier;
+    use xds_http::http_filter::ConfigType;
+    use xds_http::Rds;
+
+    let route_specifier = Some(RouteSpecifier::Rds(Rds {
+        route_config_name: rds,
+        ..Default::default()
+    }));
+
+    let http_router_filter = xds_http_filter::Router::default();
+    let conn_manager = xds_http::HttpConnectionManager {
+        route_specifier,
+        http_filters: vec![HttpFilter {
+            name: "envoy.filters.http.router".to_string(),
+            config_type: Some(ConfigType::TypedConfig(
+                protobuf::Any::from_msg(&http_router_filter).expect("invalid Router filter"),
+            )),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let api_listener = Some(xds_listener::ApiListener {
+        api_listener: Some(
+            protobuf::Any::from_msg(&conn_manager).expect("generated invald HttpConnectionManager"),
+        ),
+    });
+
+    xds_listener::Listener {
+        name,
+        api_listener,
+        ..Default::default()
+    }
+}
+
 /// Wrap a Listener with an api_listener around a RouteConfiguration and serve it
 /// as part of LDS.
-fn api_listener(route: xds_route::RouteConfiguration) -> xds_listener::Listener {
+fn route_listener(route: xds_route::RouteConfiguration) -> xds_listener::Listener {
     use xds_http::http_connection_manager::RouteSpecifier;
     use xds_http::http_filter::ConfigType;
 
@@ -559,9 +671,9 @@ fn api_listener(route: xds_route::RouteConfiguration) -> xds_listener::Listener 
 }
 
 fn build_clas<'a>(
-    svc_target: &Target,
+    service: &Service,
     port_lookup: &HashMap<(String, u16), u16>,
-    endpoint_slices: impl Iterator<Item = &'a EndpointSlice>,
+    endpoint_slices: impl Iterator<Item = &'a discovery_v1::EndpointSlice>,
 ) -> Vec<(BackendId, xds_endpoint::ClusterLoadAssignment)> {
     use xds_core::address::Address;
     use xds_core::socket_address::PortSpecifier;
@@ -587,7 +699,7 @@ fn build_clas<'a>(
 
             // the actual backend should be named with the "frontend" port to
             // match incoming service traffic.
-            let backend = svc_target.clone().into_backend(port);
+            let backend = service.as_backend_id(port);
             for endpoint in &endpoint_slice.endpoints {
                 if !is_endpoint_ready(endpoint) {
                     continue;
@@ -657,8 +769,8 @@ fn build_clas<'a>(
 
 // this sucks, the fact that targetPort can be a String is terrible!
 fn service_ports(
-    svc_ref: &ObjectRef<Service>,
-    svc: &Service,
+    svc_ref: &ObjectRef<core_v1::Service>,
+    svc: &core_v1::Service,
 ) -> Result<HashMap<(String, u16), u16>, IngestError> {
     let Some(spec) = svc.spec.as_ref() else {
         return Err(IngestError::InvalidObject {
@@ -702,7 +814,7 @@ fn service_ports(
     Ok(mapping)
 }
 
-fn endpoint_slice_ports(slice: &EndpointSlice) -> Vec<(String, u16)> {
+fn endpoint_slice_ports(slice: &discovery_v1::EndpointSlice) -> Vec<(String, u16)> {
     let Some(slice_ports) = &slice.ports else {
         return Vec::new();
     };
@@ -719,7 +831,7 @@ fn endpoint_slice_ports(slice: &EndpointSlice) -> Vec<(String, u16)> {
     ports
 }
 
-fn is_endpoint_ready(endpoint: &Endpoint) -> bool {
+fn is_endpoint_ready(endpoint: &discovery_v1::Endpoint) -> bool {
     endpoint.conditions.as_ref().map_or(false, |conditions| {
         let ready = conditions.ready.unwrap_or(false);
         conditions.serving.unwrap_or(ready)
@@ -729,13 +841,11 @@ fn is_endpoint_ready(endpoint: &Endpoint) -> bool {
 // FIXME: need many, many more tests here.
 #[cfg(test)]
 mod test {
-    use k8s_openapi::{
-        api::{
-            core::v1::ServicePort,
-            discovery::v1::{EndpointConditions, EndpointPort},
-        },
-        apimachinery::pkg::util::intstr::IntOrString,
+    use junction_api::{
+        http::{BackendRef, PathMatch, RouteMatch, RouteRule},
+        Name, Service,
     };
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
     use kube::{
         runtime::{reflector::Lookup, watcher},
         Resource, ResourceExt,
@@ -756,37 +866,48 @@ mod test {
         );
         let svc_ref = ObjectRef::from_obj(&svc);
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        let (slice_store, _) = kube::runtime::reflector::store();
         insert(&mut svc_writer, svc);
 
-        let target = Target::kube_service("prod", "coolsvc").unwrap();
+        let target = Service::kube("prod", "coolsvc").unwrap();
 
         index
-            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .service_changed(&mut snapshot, &svc_store, &slice_store, &svc_ref)
             .unwrap();
+
+        // route lookup should work as soon as the service
+        assert_eq!(
+            index.routes.lookup("coolsvc.prod.svc.cluster.local", 80),
+            Some(implicit_route_name(&svc_ref)),
+        );
 
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Cluster),
             (
                 vec![
-                    target.clone().into_backend(443).name(),
-                    target.clone().into_backend(80).name(),
+                    target.clone().as_backend_id(443).name(),
+                    target.clone().as_backend_id(80).name(),
                 ],
                 vec![],
             ),
-            "Cluster updates",
+            "create Clusters",
         );
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Listener),
             (
                 vec![
-                    target.clone().into_vhost(None).name(),
-                    target.clone().into_backend(443).lb_config_route_name(),
-                    target.clone().into_backend(80).lb_config_route_name(),
+                    target.clone().as_backend_id(443).lb_config_route_name(),
+                    target.clone().as_backend_id(80).lb_config_route_name(),
                 ],
                 vec![]
             ),
-            "Listener updates",
+            "create LB Config Listeners",
         );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::RouteConfiguration),
+            (vec![implicit_route_name(&svc_ref).to_string()], vec![]),
+            "create an implicit RouteConfig"
+        )
     }
 
     #[test]
@@ -797,38 +918,52 @@ mod test {
         let svc = externalname_service("prod", "coolsvc", "api.junctionlabs.io");
         let svc_ref = ObjectRef::from_obj(&svc);
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        let (slice_store, _) = kube::runtime::reflector::store();
         insert(&mut svc_writer, svc);
 
-        let target = Target::dns("api.junctionlabs.io").unwrap();
+        let target = Service::dns("api.junctionlabs.io").unwrap();
 
         index
-            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .service_changed(&mut snapshot, &svc_store, &slice_store, &svc_ref)
             .unwrap();
+
+        // route lookup should work as soon as the service exists. note that for
+        // externalname services, the name is still the kubernetes route name
+        // and not the ExternalName dns name!
+        assert_eq!(
+            index.routes.lookup("coolsvc.prod.svc.cluster.local", 80),
+            Some(implicit_route_name(&svc_ref)),
+        );
 
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Cluster),
             (
                 vec![
-                    target.clone().into_backend(443).name(),
-                    target.clone().into_backend(80).name(),
+                    target.as_backend_id(443).name(),
+                    target.as_backend_id(80).name(),
                 ],
                 vec![],
             ),
-            "Cluster updates",
+            "create Clusters",
         );
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Listener),
             (
                 vec![
-                    target.clone().into_vhost(None).name(),
-                    target.clone().into_backend(443).lb_config_route_name(),
-                    target.clone().into_backend(80).lb_config_route_name(),
+                    target.as_backend_id(443).lb_config_route_name(),
+                    target.as_backend_id(80).lb_config_route_name(),
                 ],
                 vec![]
             ),
-            "Listener updates",
+            "create LB Config Listeners",
         );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::RouteConfiguration),
+            (vec![implicit_route_name(&svc_ref).to_string()], vec![]),
+            "create an implicit RouteConfig"
+        )
     }
+
     // deleting a service should remove all of the clusters/listeners created
     #[test]
     fn test_create_delete_service() {
@@ -838,21 +973,27 @@ mod test {
             &[("http", 80, 8009), ("https", 443, 8010)],
         );
         let svc_ref = ObjectRef::from_obj(&svc);
-        let svc_target = to_service_target(&svc_ref).unwrap();
+        let svc_target = kube_svc_from(&svc_ref).unwrap();
 
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        let (slice_store, _) = kube::runtime::reflector::store();
         insert(&mut svc_writer, svc.clone());
 
         let mut index = IngestIndex::default();
         index
-            .service_changed(&mut ResourceSnapshot::new(), &svc_store, &svc_ref)
+            .service_changed(
+                &mut ResourceSnapshot::new(),
+                &svc_store,
+                &slice_store,
+                &svc_ref,
+            )
             .unwrap();
 
         delete(&mut svc_writer, svc);
 
         let mut snapshot = ResourceSnapshot::new();
         index
-            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .service_changed(&mut snapshot, &svc_store, &slice_store, &svc_ref)
             .unwrap();
 
         assert_eq!(
@@ -860,8 +1001,8 @@ mod test {
             (
                 vec![],
                 vec![
-                    svc_target.clone().into_backend(443).name(),
-                    svc_target.clone().into_backend(80).name()
+                    svc_target.clone().as_backend_id(443).name(),
+                    svc_target.clone().as_backend_id(80).name()
                 ],
             ),
             "service delete a Cluster for each port",
@@ -871,9 +1012,8 @@ mod test {
             (
                 vec![],
                 vec![
-                    svc_target.clone().into_vhost(None).name(),
-                    svc_target.clone().into_backend(443).lb_config_route_name(),
-                    svc_target.clone().into_backend(80).lb_config_route_name(),
+                    svc_target.as_backend_id(443).lb_config_route_name(),
+                    svc_target.as_backend_id(80).lb_config_route_name(),
                 ],
             ),
             "service should delete LB passthrough listeners and the default listener",
@@ -893,32 +1033,38 @@ mod test {
         let svc_ref = ObjectRef::from_obj(&svc);
 
         let (svc_store, _) = kube::runtime::reflector::store();
+        let (slice_store, _) = kube::runtime::reflector::store();
 
         let mut index = IngestIndex::default();
         let mut snapshot = ResourceSnapshot::new();
         index
-            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .service_changed(&mut snapshot, &svc_store, &slice_store, &svc_ref)
             .unwrap();
 
-        assert!(snapshot.is_empty(), "should do nothing");
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::RouteConfiguration),
+            (vec![], vec![implicit_route_name(&svc_ref).to_string()]),
+            "should try to delete the implicit RouteConfig"
+        );
     }
 
-    // creating a new service after an HTTPRoute exists for it shouldn't create
-    // implicit Routes for it.
+    // creating a new service after an HTTPRoute exists for it.
     #[test]
     fn test_new_service_route_exists() {
         let svc = clusterip_service(
-            "coolsvc",
             "prod",
+            "coolsvc",
             &[("http", 80, 8009), ("https", 443, 8010)],
         );
         let svc_ref = ObjectRef::from_obj(&svc);
-        let svc_target = to_service_target(&svc_ref).unwrap();
+        let service = Service::kube("prod", "coolsvc").unwrap();
 
-        let httproute = example_route("coolsvc-pass", "prod", svc_target.clone().into_vhost(None));
+        let httproute = example_route("prod", "cool-example", service.clone(), 443);
         let httproute_ref = ObjectRef::from_obj(&httproute);
 
+        // setup store. the order doesn't matter here.
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        let (slice_store, _) = kube::runtime::reflector::store();
         insert(&mut svc_writer, svc);
 
         let (route_store, mut route_writer) = kube::runtime::reflector::store();
@@ -926,28 +1072,43 @@ mod test {
 
         let mut index = IngestIndex::default();
 
+        // handle index changes. the order matters here - all we're testing is
+        // how the index deals with update order.
         let mut snapshot = ResourceSnapshot::new();
         index
-            .httproute_changed(&mut snapshot, &route_store, &svc_store, &httproute_ref)
+            .httproute_changed(&mut snapshot, &route_store, &httproute_ref)
             .unwrap();
 
+        // route lookup should work as soon as the route exists
         assert_eq!(
-            snapshot.updates_and_deletes(ResourceType::Listener),
-            (vec![svc_target.clone().into_vhost(None).name()], vec![]),
-            "route should create a Listener",
+            index.routes.lookup("coolsvc.prod.svc.cluster.local", 80),
+            Some(Name::from_static("cool-example")),
         );
 
+        // snapshot should include the new RouteConfig
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::Listener),
+            (vec![], vec![]),
+            "no Listeners should change",
+        );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::RouteConfiguration),
+            (vec![httproute_ref.name], vec![]),
+            "should create a RouteConfig"
+        );
+
+        // update to add the Service now
         let mut snapshot = ResourceSnapshot::new();
         index
-            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .service_changed(&mut snapshot, &svc_store, &slice_store, &svc_ref)
             .unwrap();
 
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Cluster),
             (
                 vec![
-                    svc_target.clone().into_backend(443).name(),
-                    svc_target.clone().into_backend(80).name()
+                    service.as_backend_id(443).name(),
+                    service.as_backend_id(80).name()
                 ],
                 vec![],
             ),
@@ -957,55 +1118,63 @@ mod test {
             snapshot.updates_and_deletes(ResourceType::Listener),
             (
                 vec![
-                    svc_target.clone().into_backend(443).lb_config_route_name(),
-                    svc_target.clone().into_backend(80).lb_config_route_name(),
+                    service.as_backend_id(443).lb_config_route_name(),
+                    service.as_backend_id(80).lb_config_route_name(),
                 ],
                 vec![]
             ),
-            "service should only create LB passthrough listeners",
+            "service should create LB config listeners",
+        );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::RouteConfiguration),
+            (vec![implicit_route_name(&svc_ref).to_string()], vec![]),
+            "should create an implicit RouteConfig"
         );
     }
 
-    // creating an explicit route for a Service should delete any implicit
-    // routes that were already created.
     #[test]
     fn test_new_route_service_exists() {
         let svc = clusterip_service(
-            "coolsvc",
             "prod",
+            "coolsvc",
             &[("http", 80, 8009), ("https", 443, 8010)],
         );
         let svc_ref = ObjectRef::from_obj(&svc);
-        let svc_target = to_service_target(&svc_ref).unwrap();
+        let svc_target = kube_svc_from(&svc_ref).unwrap();
 
-        let httproute = example_route("coolsvc-pass", "prod", svc_target.clone().into_vhost(None));
+        let httproute = example_route("coolsvc-pass", "prod", svc_target.clone(), 443);
         let httproute_ref = ObjectRef::from_obj(&httproute);
 
+        // setup store. the order doesn't matter here.
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
         insert(&mut svc_writer, svc);
 
         let (route_store, mut route_writer) = kube::runtime::reflector::store();
+        let (slice_store, _) = kube::runtime::reflector::store();
         insert(&mut route_writer, httproute);
 
+        // handle index changes. the order matters here - all we're testing is
+        // how the index deals with update order.
         let mut index = IngestIndex::default();
 
         let mut snapshot = ResourceSnapshot::new();
         index
-            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .service_changed(&mut snapshot, &svc_store, &slice_store, &svc_ref)
             .unwrap();
 
-        assert!(
-            index
-                .implicit_routes
-                .contains(&svc_target.clone().into_vhost(None)),
-            "vhost should tracked as having an implicit route"
+        // lookup should return the implicit route and the snapshot should
+        // contain Clusters and implicit RouteConfigs for the Service.
+        assert_eq!(
+            index.routes.lookup("coolsvc.prod.svc.cluster.local", 80),
+            Some(implicit_route_name(&svc_ref)),
         );
+
         assert_eq!(
             snapshot.updates_and_deletes(ResourceType::Cluster),
             (
                 vec![
-                    svc_target.clone().into_backend(443).name(),
-                    svc_target.clone().into_backend(80).name()
+                    svc_target.as_backend_id(443).name(),
+                    svc_target.as_backend_id(80).name()
                 ],
                 vec![],
             ),
@@ -1015,123 +1184,151 @@ mod test {
             snapshot.updates_and_deletes(ResourceType::Listener),
             (
                 vec![
-                    svc_target.name(),
-                    svc_target.clone().into_backend(443).lb_config_route_name(),
-                    svc_target.clone().into_backend(80).lb_config_route_name(),
+                    svc_target.as_backend_id(443).lb_config_route_name(),
+                    svc_target.as_backend_id(80).lb_config_route_name(),
                 ],
                 vec![]
             ),
-            "service create passthrough and implicit routes",
+            "service should create lb config Listeners",
+        );
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::RouteConfiguration),
+            (vec![implicit_route_name(&svc_ref).to_string()], vec![]),
+            "service should create implicit route",
         );
 
         let mut snapshot = ResourceSnapshot::new();
         index
-            .httproute_changed(&mut snapshot, &route_store, &svc_store, &httproute_ref)
+            .httproute_changed(&mut snapshot, &route_store, &httproute_ref)
             .unwrap();
 
+        // lookup should return the explicit route and the snapshot should
+        // contain a new RouteConfig.
         assert_eq!(
-            snapshot.updates_and_deletes(ResourceType::Listener),
-            (vec![svc_target.clone().into_vhost(None).name()], vec![]),
-            "route should create a Listener that overrides the passthrough",
+            index.routes.lookup("coolsvc.prod.svc.cluster.local", 80),
+            Some(Name::from_str(&httproute_ref.name).unwrap()),
         );
-        assert!(
-            !index
-                .implicit_routes
-                .contains(&svc_target.clone().into_vhost(None)),
-            "vhost should not be tracked as having an implicit route"
+        assert_eq!(
+            snapshot.updates_and_deletes(ResourceType::RouteConfiguration),
+            (vec![httproute_ref.name], vec![]),
+            "service create passthrough and implicit routes",
         );
     }
 
     #[test]
     fn test_delete_route_cluserip_service_exists() {
+        let route = {
+            let id = Name::from_static("cool-route");
+            let service = Service::kube("prod", "coolsvc").unwrap();
+            Route {
+                id,
+                hostnames: vec![service.hostname().into()],
+                ports: vec![],
+                tags: Default::default(),
+                rules: vec![RouteRule {
+                    matches: vec![RouteMatch {
+                        path: Some(PathMatch::empty_prefix()),
+                        ..Default::default()
+                    }],
+                    backends: vec![BackendRef {
+                        service,
+                        port: Some(443),
+                        weight: 1,
+                    }],
+                    ..Default::default()
+                }],
+            }
+        };
         let svc = clusterip_service(
             "prod",
             "coolsvc",
             &[("http", 80, 8009), ("https", 443, 8010)],
         );
-        let svc_target = Target::kube_service("prod", "coolsvc").unwrap();
+        let svc_ref = ObjectRef::from_obj(&svc);
 
         test_delete_route(
-            svc_target.clone(),
+            route,
             svc,
-            // initial update should create HTTPRoute listener and config listeners
-            vec![
-                svc_target.name(),
-                svc_target.clone().into_backend(443).lb_config_route_name(),
-                svc_target.clone().into_backend(80).lb_config_route_name(),
-            ],
-            // deleting the HTTProute should update the named listener
-            vec![svc_target.name()],
+            "coolsvc.prod.svc.cluster.local",
+            Some(implicit_route_name(&svc_ref)),
         );
     }
 
     #[test]
     fn test_delete_route_externalname_service_exists() {
+        let route = {
+            let id = Name::from_static("coolapi-route");
+            let service = Service::dns("coolapi.com").unwrap();
+            Route {
+                id,
+                hostnames: vec![service.hostname().into()],
+                ports: vec![],
+                tags: Default::default(),
+                rules: vec![RouteRule {
+                    matches: vec![RouteMatch {
+                        path: Some(PathMatch::empty_prefix()),
+                        ..Default::default()
+                    }],
+                    backends: vec![BackendRef {
+                        service,
+                        port: Some(443),
+                        weight: 1,
+                    }],
+                    ..Default::default()
+                }],
+            }
+        };
         let svc = externalname_service("prod", "coolsvc", "coolapi.com");
-        let svc_target = Target::dns("coolapi.com").unwrap();
 
-        test_delete_route(
-            svc_target.clone(),
-            svc,
-            // initial update should create HTTPRoute listener and config listeners
-            vec![
-                svc_target.name(),
-                svc_target.clone().into_backend(443).lb_config_route_name(),
-                svc_target.clone().into_backend(80).lb_config_route_name(),
-            ],
-            // deleting the HTTProute should update the named listener
-            vec![svc_target.name()],
-        );
+        test_delete_route(route, svc, "coolapi.com", None);
     }
 
-    // deleting a route for an existing service should re-create the implicit
-    // route for that service.
+    // deleting a route for an existing service should expose the implicit route
+    // for that service.
     fn test_delete_route(
-        svc_target: Target,
-        svc: Service,
-        initial_updates: Vec<String>,
-        updates_after_delete: Vec<String>,
+        route: Route,
+        svc: core_v1::Service,
+        lookup_name: &str,
+        route_after_delete: Option<Name>,
     ) {
-        let svc_ref = ObjectRef::from_obj(&svc);
-
-        let httproute = example_route("prod", "example-route", svc_target.clone().into_vhost(None));
+        let httproute = route
+            .to_gateway_httproute(svc.meta().namespace.as_deref().unwrap_or_default())
+            .unwrap();
         let httproute_ref = ObjectRef::from_obj(&httproute);
 
+        let svc_ref = ObjectRef::from_obj(&svc);
+
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
+        let (slice_store, _) = kube::runtime::reflector::store();
         insert(&mut svc_writer, svc);
 
         let (route_store, mut route_writer) = kube::runtime::reflector::store();
         insert(&mut route_writer, httproute.clone());
 
-        // create the index and insert both the service and route
+        // create the index and insert both the service and route and look it up
         let mut index = IngestIndex::default();
         let mut snapshot = ResourceSnapshot::new();
         index
-            .service_changed(&mut snapshot, &svc_store, &svc_ref)
+            .service_changed(&mut snapshot, &svc_store, &slice_store, &svc_ref)
             .unwrap();
         index
-            .httproute_changed(&mut snapshot, &route_store, &svc_store, &httproute_ref)
+            .httproute_changed(&mut snapshot, &route_store, &httproute_ref)
             .unwrap();
 
         assert_eq!(
-            snapshot.updates_and_deletes(ResourceType::Listener),
-            (initial_updates, vec![]),
-            "passthrough and implicit routes were created",
+            index.routes.lookup(lookup_name, 80),
+            Some(route.id.clone()),
+            "should find the route before deleting"
         );
 
-        // delete the route from the store
+        // delete the route from the store and then try to look it up
         delete(&mut route_writer, httproute);
 
         let mut snapshot = ResourceSnapshot::new();
         index
-            .httproute_changed(&mut snapshot, &route_store, &svc_store, &httproute_ref)
+            .httproute_changed(&mut snapshot, &route_store, &httproute_ref)
             .unwrap();
-
-        assert_eq!(
-            snapshot.updates_and_deletes(ResourceType::Listener),
-            (updates_after_delete, vec![]),
-            "route should be replaced with the implicit route",
-        )
+        assert_eq!(index.routes.lookup(lookup_name, 80), route_after_delete,);
     }
 
     #[test]
@@ -1153,7 +1350,7 @@ mod test {
             [("http", 8009), ("https", 8010)],
             ["192.168.1.3", "192.168.1.4"],
         );
-        let svc_target = Target::kube_service("prod", "coolsvc").unwrap();
+        let svc_target = Service::kube("prod", "coolsvc").unwrap();
         let svc_ref = ObjectRef::from_obj(&svc);
 
         let (svc_store, mut svc_writer) = kube::runtime::reflector::store();
@@ -1165,7 +1362,12 @@ mod test {
 
         let mut index = IngestIndex::default();
         index
-            .service_changed(&mut ResourceSnapshot::new(), &svc_store, &svc_ref)
+            .service_changed(
+                &mut ResourceSnapshot::new(),
+                &svc_store,
+                &slice_store,
+                &svc_ref,
+            )
             .unwrap();
 
         let mut snapshot = ResourceSnapshot::new();
@@ -1177,8 +1379,8 @@ mod test {
             snapshot.updates_and_deletes(ResourceType::ClusterLoadAssignment),
             (
                 vec![
-                    svc_target.clone().into_backend(443).name(),
-                    svc_target.clone().into_backend(80).name()
+                    svc_target.clone().as_backend_id(443).name(),
+                    svc_target.clone().as_backend_id(80).name()
                 ],
                 vec![]
             ),
@@ -1201,19 +1403,44 @@ mod test {
         store.apply_watcher_event(&watcher::Event::Delete(object));
     }
 
-    fn example_route(namespace: &'static str, name: &'static str, vhost: VirtualHost) -> HTTPRoute {
-        Route::passthrough_route(vhost)
-            .to_gateway_httproute(namespace, name)
-            .unwrap()
+    #[track_caller]
+    fn example_route(
+        namespace: &'static str,
+        name: &'static str,
+        service: Service,
+        port: u16,
+    ) -> HTTPRoute {
+        let route = {
+            let id = Name::from_static(name);
+            Route {
+                id,
+                hostnames: vec![service.hostname().into()],
+                ports: vec![],
+                tags: Default::default(),
+                rules: vec![RouteRule {
+                    matches: vec![RouteMatch {
+                        path: Some(PathMatch::empty_prefix()),
+                        ..Default::default()
+                    }],
+                    backends: vec![BackendRef {
+                        service,
+                        port: Some(port),
+                        weight: 1,
+                    }],
+                    ..Default::default()
+                }],
+            }
+        };
+        route.to_gateway_httproute(namespace).unwrap()
     }
 
     fn endpoint_slice(
-        svc: &Service,
+        svc: &core_v1::Service,
         slice_name: &'static str,
         ports: impl IntoIterator<Item = (&'static str, u16)>,
         addrs: impl IntoIterator<Item = &'static str>,
-    ) -> EndpointSlice {
-        let mut slice = EndpointSlice::default();
+    ) -> discovery_v1::EndpointSlice {
+        let mut slice = discovery_v1::EndpointSlice::default();
         slice.meta_mut().namespace = svc.meta().namespace.clone();
         slice.meta_mut().name = Some(slice_name.to_string());
 
@@ -1225,9 +1452,9 @@ mod test {
 
         slice.address_type = "IPv4".to_string();
         for addr in addrs {
-            let endpoint = Endpoint {
+            let endpoint = discovery_v1::Endpoint {
                 addresses: vec![addr.to_string()],
-                conditions: Some(EndpointConditions {
+                conditions: Some(discovery_v1::EndpointConditions {
                     ready: Some(true),
                     serving: Some(true),
                     ..Default::default()
@@ -1238,7 +1465,7 @@ mod test {
         }
 
         for (name, port) in ports {
-            let endpoint_port = EndpointPort {
+            let endpoint_port = discovery_v1::EndpointPort {
                 name: Some(name.to_string()),
                 port: Some(port as i32),
                 protocol: Some("TCP".to_string()),
@@ -1254,8 +1481,8 @@ mod test {
         namespace: &'static str,
         name: &'static str,
         ports: &'static [(&'static str, u16, u16)],
-    ) -> Service {
-        let mut svc = Service::default();
+    ) -> core_v1::Service {
+        let mut svc = core_v1::Service::default();
         svc.meta_mut().name = Some(name.to_string());
         svc.meta_mut().namespace = Some(namespace.to_string());
 
@@ -1264,7 +1491,7 @@ mod test {
 
         let mut svc_ports = vec![];
         for &(name, port, target_port) in ports {
-            svc_ports.push(ServicePort {
+            svc_ports.push(core_v1::ServicePort {
                 name: Some(name.to_string()),
                 port: port as i32,
                 target_port: Some(IntOrString::Int(target_port as i32)),
@@ -1280,8 +1507,8 @@ mod test {
         namespace: &'static str,
         name: &'static str,
         hostname: &'static str,
-    ) -> Service {
-        let mut svc = Service::default();
+    ) -> core_v1::Service {
+        let mut svc = core_v1::Service::default();
         svc.meta_mut().name = Some(name.to_string());
         svc.meta_mut().namespace = Some(namespace.to_string());
 
