@@ -1206,8 +1206,8 @@ dependencies = [
 
 [[package]]
 name = "junction-api"
-version = "0.1.1"
-source = "git+https://github.com/junction-labs/junction-client#96ef8bf04fafcbf6ac1b4605720844f6f01afad0"
+version = "0.2.0"
+source = "git+https://github.com/junction-labs/junction-client#0fcd985fbe4971c8fbaf161660fd96754d5f7c1e"
 dependencies = [
  "gateway-api",
  "http 1.1.0",
