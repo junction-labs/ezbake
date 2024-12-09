@@ -1207,7 +1207,7 @@ dependencies = [
 [[package]]
 name = "junction-api"
 version = "0.1.1"
-source = "git+https://github.com/junction-labs/junction-client#eccb1598ab53743280aaa5d6d7f37808b64e4c60"
+source = "git+https://github.com/junction-labs/junction-client#40df1dbc91a91b867cc19a8445ccc3e45e2d67d7"
 dependencies = [
  "gateway-api",
  "http 1.1.0",
@@ -1217,6 +1217,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "smol_str",
  "thiserror",
  "xds-api",
 ]
