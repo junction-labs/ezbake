@@ -254,6 +254,7 @@ impl AdsConnection {
         trace!(
             sub_last_sent_version = ?sub.last_sent_version,
             snapshot_version = ?self.snapshot.version(changed_type),
+            ?changed_type,
             "snapshot updated",
         );
         if sub.last_sent_version == self.snapshot.version(changed_type) {
