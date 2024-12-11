@@ -20,7 +20,7 @@ use k8s_openapi::{
     apimachinery::pkg::util::intstr::IntOrString,
 };
 use kube::runtime::reflector::{ObjectRef, Store};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace, warn, Level};
 use xds_api::pb::{
     envoy::{
         config::{
@@ -226,7 +226,13 @@ pub(crate) struct RouteIndex {
 
 #[derive(Debug, Default)]
 struct RouteIndexInner {
+    // listener -> route
+    //
+    // TODO: this is janky and backwards but it works for now
+    listeners: SkipMap<String, Name>,
+    // route -> ([hostname], [port])
     explicit: SkipMap<Name, (Vec<HostnameMatch>, Vec<u16>)>,
+    // route -> ([hostname], [port])
     implicit: SkipMap<Name, (Vec<HostnameMatch>, Vec<u16>)>,
 }
 
@@ -236,18 +242,15 @@ impl crate::xds::SnapshotCallback for RouteIndex {
             return;
         }
 
-        // parse (hostname, port) out of the resource name
-        let Some((hostname, port)) = resource_name.split_once(':') else {
-            return;
-        };
-        let Ok(port) = port.parse() else {
-            return;
-        };
+        if let Some(route_name) = self.lookup_str(resource_name) {
+            trace!(resource_name, "computing dynamic listener");
 
-        if let Some(route_name) = self.lookup(hostname, port) {
             let mut snapshot = ResourceSnapshot::new();
             let listener = rds_listener(resource_name.to_string(), route_name.to_string());
             let xds = into_any!(listener);
+            self.inner
+                .listeners
+                .insert(listener.name.clone(), route_name.clone());
             snapshot.insert_update(ResourceType::Listener, listener.name, xds);
             let _ = writer.update(snapshot);
         }
@@ -255,13 +258,21 @@ impl crate::xds::SnapshotCallback for RouteIndex {
 }
 
 impl RouteIndex {
-    fn add_explicit(&self, route: &Route) {
+    fn add_explicit(&self, snapshot: &mut ResourceSnapshot, route: &Route) {
         let hostnames = route.hostnames.clone();
         let ports = route.ports.clone();
 
         self.inner
             .explicit
             .insert(route.id.clone(), (hostnames, ports));
+
+        for entry in self.inner.listeners.iter() {
+            let listener_name = entry.key();
+            if matches_route_hostnames_str((&route.hostnames, &route.ports), &listener_name) {
+                entry.remove();
+                snapshot.insert_delete(ResourceType::Listener, listener_name.to_string());
+            }
+        }
     }
 
     fn add_implicit(&self, route: &Route) {
@@ -281,6 +292,13 @@ impl RouteIndex {
         self.inner.implicit.remove(name);
     }
 
+    fn lookup_str(&self, name: &str) -> Option<Name> {
+        let (hostname, port) = name.split_once(':')?;
+        let port = port.parse().ok()?;
+
+        self.lookup(hostname, port)
+    }
+
     fn lookup(&self, hostname: &str, port: u16) -> Option<Name> {
         // this is an extremely inefficient linear scan of all of the
         // existing routes. this is fine for ezbake, since we expect to
@@ -289,12 +307,7 @@ impl RouteIndex {
         // walk explicit routes first
         for entry in self.inner.explicit.iter() {
             let (hostnames, ports) = entry.value();
-            // check port match first, it's ez
-            if !(ports.is_empty() || ports.contains(&port)) {
-                continue;
-            }
-
-            if !hostnames.iter().any(|h| h.matches_str(hostname)) {
+            if !matches_route_hostnames((hostnames, ports), hostname, port) {
                 continue;
             }
 
@@ -305,11 +318,7 @@ impl RouteIndex {
         for entry in self.inner.implicit.iter() {
             let (hostnames, ports) = entry.value();
             // check port match first, it's ez
-            if !(ports.is_empty() || ports.contains(&port)) {
-                continue;
-            }
-
-            if !hostnames.iter().any(|h| h.matches_str(hostname)) {
+            if !matches_route_hostnames((hostnames, ports), hostname, port) {
                 continue;
             }
 
@@ -319,6 +328,33 @@ impl RouteIndex {
         // ope nada
         None
     }
+}
+
+fn matches_route_hostnames_str(haystack: (&[HostnameMatch], &[u16]), name: &str) -> bool {
+    let Some((hostname, port)) = name.split_once(':') else {
+        return false;
+    };
+    let Ok(port) = port.parse() else {
+        return false;
+    };
+
+    matches_route_hostnames(haystack, hostname, port)
+}
+
+fn matches_route_hostnames(
+    (hostname_matches, port_matches): (&[HostnameMatch], &[u16]),
+    hostname: &str,
+    port: u16,
+) -> bool {
+    if !(port_matches.is_empty() || port_matches.contains(&port)) {
+        return false;
+    }
+
+    if !hostname_matches.iter().any(|h| h.matches_str(hostname)) {
+        return false;
+    }
+
+    true
 }
 
 #[derive(Debug, Default)]
@@ -359,16 +395,22 @@ impl IngestIndex {
     /// On delete, remove the HTTPRoute from the index and remove the route. If
     /// the Route targeted an existing kube Service that now no longer has a
     /// Route, re-generate an implicit one.
+    #[tracing::instrument(skip_all, fields(%route_ref), level = Level::TRACE)]
     fn httproute_changed(
         &mut self,
         snapshot: &mut ResourceSnapshot,
         routes: &Store<HTTPRoute>,
         route_ref: &ObjectRef<HTTPRoute>,
     ) -> Result<(), IngestError> {
+        trace!("changed");
+        // FIXME: we're using just the HTTPRoute name as the Route ID which seems terrible?
+
         match routes.get(route_ref) {
             Some(http_route) => {
                 let route = Route::from_gateway_httproute(&http_route)?;
-                self.routes.add_explicit(&route);
+
+                // add the explicit route, which deletes any created listeners
+                self.routes.add_explicit(snapshot, &route);
 
                 // TODO: if the Route has ports and explicit hostnames, we
                 // can generate listeners for them ahead of time. don't bother yet.
@@ -378,11 +420,22 @@ impl IngestIndex {
                 snapshot.insert_update(ResourceType::RouteConfiguration, xds_route.name, xds);
             }
             None => {
-                // FIXME: we're using just the HTTPRoute name as the Route ID which seems terrible?
                 let route_name = Name::from_str(&route_ref.name).expect(
                     "a valid Kubernetes name should be a valid name. this is a bug in Junction",
                 );
                 self.routes.remove(&route_name);
+                snapshot.insert_delete(ResourceType::RouteConfiguration, route_name.to_string());
+
+                // remove all of the entries pointing at this RouteConfig
+                let to_remove = self
+                    .routes
+                    .inner
+                    .listeners
+                    .iter()
+                    .filter(|e| e.value() == &route_name);
+                for listener_name in to_remove {
+                    snapshot.insert_delete(ResourceType::Listener, listener_name.key().to_string());
+                }
             }
         }
 
@@ -399,6 +452,11 @@ impl IngestIndex {
     ///
     /// Returns `true` if this Service is newly created, so that we can re-trigger
     /// an endpointSlice update.
+    #[tracing::instrument(
+        skip_all,
+        level = Level::TRACE,
+        fields(svc_ref = %svc_ref),
+    )]
     fn service_changed(
         &mut self,
         snapshot: &mut ResourceSnapshot,
@@ -406,6 +464,7 @@ impl IngestIndex {
         slice_store: &Store<discovery_v1::EndpointSlice>,
         svc_ref: &ObjectRef<core_v1::Service>,
     ) -> Result<(), IngestError> {
+        trace!("changed");
         let mut created = false;
 
         match svc_store.get(svc_ref).as_ref() {
@@ -497,6 +556,7 @@ impl IngestIndex {
     // the reverse mapping from `targetPort` back to `port`. Because of this,
     // services_changed calls endpoints_changed every time a service is created
     // from nothing.
+    #[tracing::instrument(skip_all, level = Level::TRACE)]
     fn endpoints_changed<'a, I>(
         &mut self,
         snapshot: &mut ResourceSnapshot,
@@ -507,6 +567,7 @@ impl IngestIndex {
     where
         I: IntoIterator<Item = &'a ObjectRef<core_v1::Service>>,
     {
+        trace!("changed");
         let mut svc_slices: HashMap<_, _> = services
             .into_iter()
             .map(|svc_ref| (svc_ref, Vec::new()))
@@ -1130,6 +1191,12 @@ mod test {
             (vec![implicit_route_name(&svc_ref).to_string()], vec![]),
             "should create an implicit RouteConfig"
         );
+
+        // route lookup should still return the route
+        assert_eq!(
+            index.routes.lookup("coolsvc.prod.svc.cluster.local", 80),
+            Some(Name::from_static("cool-example")),
+        );
     }
 
     #[test]
@@ -1328,7 +1395,7 @@ mod test {
         index
             .httproute_changed(&mut snapshot, &route_store, &httproute_ref)
             .unwrap();
-        assert_eq!(index.routes.lookup(lookup_name, 80), route_after_delete,);
+        assert_eq!(index.routes.lookup(lookup_name, 80), route_after_delete);
     }
 
     #[test]

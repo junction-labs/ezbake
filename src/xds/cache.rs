@@ -310,6 +310,7 @@ impl SnapshotCache {
                 resource_name,
             )
         }
+
         self.inner.typed[resource_type].resources.get(resource_name)
     }
 

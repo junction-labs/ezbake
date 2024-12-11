@@ -270,6 +270,8 @@ fn handle_watch_event<T: KubeResource>(
             let old_obj = store.get(&new_ref.obj);
             let has_changed = old_obj.map_or(true, |obj| obj.has_changed(new_obj));
 
+            trace!(kind = T::static_kind(), event = "apply", obj = %new_ref.obj);
+
             if has_changed {
                 changed.insert(new_ref);
                 debounce.get_or_insert_with(|| Instant::now() + debounce_duration);
@@ -277,7 +279,10 @@ fn handle_watch_event<T: KubeResource>(
         }
         // On delete, mark the object as changed and send the ref along.
         watcher::Event::Delete(obj) => {
-            changed.insert(RefAndParents::from_obj(obj));
+            let obj_ref = RefAndParents::from_obj(obj);
+            trace!(kind = T::static_kind(), event = "delete", obj = %obj_ref.obj);
+
+            changed.insert(obj_ref);
             debounce.get_or_insert_with(|| Instant::now() + debounce_duration);
         }
         // On init, we mark everything in the store as changed and pause the
