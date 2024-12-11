@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
     str::FromStr,
     sync::{
@@ -21,6 +21,7 @@ use crate::xds::resources::ResourceType;
 /// A set of updates/deletes to apply to a [SnapshotCache].
 pub(crate) struct ResourceSnapshot {
     resources: EnumMap<ResourceType, BTreeMap<String, Option<protobuf::Any>>>,
+    touch: EnumMap<ResourceType, BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for ResourceSnapshot {
@@ -38,6 +39,7 @@ impl ResourceSnapshot {
     pub(crate) fn new() -> Self {
         Self {
             resources: EnumMap::default(),
+            touch: EnumMap::default(),
         }
     }
 
@@ -65,6 +67,14 @@ impl ResourceSnapshot {
         counts
     }
 
+    pub(crate) fn touch_counts(&self) -> EnumMap<ResourceType, usize> {
+        let mut counts = EnumMap::default();
+        for (resource_type, names) in &self.touch {
+            counts[resource_type] = names.len();
+        }
+        counts
+    }
+
     pub(crate) fn insert_update(
         &mut self,
         resource_type: ResourceType,
@@ -76,6 +86,10 @@ impl ResourceSnapshot {
 
     pub(crate) fn insert_delete(&mut self, resource_type: ResourceType, name: String) {
         self.resources[resource_type].insert(name, None);
+    }
+
+    pub(crate) fn touch(&mut self, resource_type: ResourceType, name: String) {
+        self.touch[resource_type].insert(name);
     }
 
     #[cfg(test)]
@@ -310,6 +324,7 @@ impl SnapshotCache {
                 resource_name,
             )
         }
+
         self.inner.typed[resource_type].resources.get(resource_name)
     }
 
@@ -371,6 +386,7 @@ pub(crate) struct SnapshotWriter {
 impl SnapshotWriter {
     pub(crate) fn update(&mut self, snapshot: ResourceSnapshot) -> ResourceVersion {
         let version = self.inner.version.next();
+        let mut notify: EnumMap<ResourceType, bool> = EnumMap::default();
 
         for (resource_type, updates) in snapshot.resources {
             let cache = &self.inner.typed[resource_type];
@@ -395,6 +411,26 @@ impl SnapshotWriter {
                 // versions so that once you can see the snapshot version change,
                 // changes to all resources are visible as well.
                 cache.version.store(version.to_u64(), Ordering::SeqCst);
+                notify[resource_type] = true;
+            }
+        }
+
+        for (resource_type, names) in snapshot.touch {
+            let cache = &self.inner.typed[resource_type];
+
+            for name in names {
+                if let Some(entry) = cache.resources.get(&name) {
+                    let proto = entry.value().proto.clone();
+                    cache
+                        .resources
+                        .insert(name, VersionedProto { version, proto });
+                    notify[resource_type] = true;
+                }
+            }
+        }
+
+        for (resource_type, should_notify) in notify {
+            if should_notify {
                 // ignore the error. it just means there's nothing to do
                 let _ = self.inner.notifications.send(resource_type);
             }

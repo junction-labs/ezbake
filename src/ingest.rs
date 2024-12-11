@@ -1,11 +1,11 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,
     str::FromStr,
     sync::Arc,
 };
 
-use crossbeam_skiplist::SkipMap;
+use crossbeam_skiplist::{map::Entry, SkipMap};
 use junction_api::{backend::Backend, http::Route};
 use junction_api::{backend::BackendId, Service};
 use junction_api::{
@@ -20,7 +20,7 @@ use k8s_openapi::{
     apimachinery::pkg::util::intstr::IntOrString,
 };
 use kube::runtime::reflector::{ObjectRef, Store};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn, Level};
 use xds_api::pb::{
     envoy::{
         config::{
@@ -153,7 +153,7 @@ where
     let mut snapshot = ResourceSnapshot::new();
     for changed in &*changed_objects {
         if let Err(e) = f(&mut snapshot, &changed.obj) {
-            info!(
+            warn!(
                 err = %e,
                 "kube_kind" = K::static_kind(),
                 "object" = %changed.obj,
@@ -175,7 +175,7 @@ where
 
     if let Err(errs) = f(&mut snapshot, changed_objects) {
         for err in errs {
-            warn!(%err, "kube_kind" = K::static_kind(), "snapshot update failed")
+            warn!(%err, "kube_kind" = K::static_kind(), "batch update failed")
         }
     }
 
@@ -187,8 +187,9 @@ fn write_snapshot(writer: &mut SnapshotWriter, snapshot: ResourceSnapshot) {
         return;
     }
 
-    let updates = snapshot.update_counts();
-    let deletes = snapshot.delete_counts();
+    let update = snapshot.update_counts();
+    let delete = snapshot.delete_counts();
+    let touch = snapshot.touch_counts();
     let version = writer.update(snapshot);
     debug!(
         version = %version,
@@ -197,8 +198,9 @@ fn write_snapshot(writer: &mut SnapshotWriter, snapshot: ResourceSnapshot) {
         //
         // https://docs.rs/tracing/0.1.40/tracing/index.html#unstable-features
         // https://docs.rs/valuable/0.1.0/valuable/
-        ?updates,
-        ?deletes,
+        ?update,
+        ?delete,
+        ?touch,
         "updated snapshot"
     );
 }
@@ -226,28 +228,34 @@ pub(crate) struct RouteIndex {
 
 #[derive(Debug, Default)]
 struct RouteIndexInner {
+    // listener -> route
+    //
+    // this could be route -> [Listener]. we'd pay more on update b/c we have to
+    // copy each value, but then lookup would be better. this does not matter
+    // that at this scale (tens of routes) but should be rethought.
+    listeners: SkipMap<String, Name>,
+    // route -> ([hostname], [port])
     explicit: SkipMap<Name, (Vec<HostnameMatch>, Vec<u16>)>,
+    // route -> ([hostname], [port])
     implicit: SkipMap<Name, (Vec<HostnameMatch>, Vec<u16>)>,
 }
 
 impl crate::xds::SnapshotCallback for RouteIndex {
+    #[tracing::instrument(skip(self, writer))]
     fn call(&self, mut writer: SnapshotWriter, resource_type: ResourceType, resource_name: &str) {
         if resource_type != ResourceType::Listener {
             return;
         }
 
-        // parse (hostname, port) out of the resource name
-        let Some((hostname, port)) = resource_name.split_once(':') else {
-            return;
-        };
-        let Ok(port) = port.parse() else {
-            return;
-        };
-
-        if let Some(route_name) = self.lookup(hostname, port) {
+        if let Some(route_name) = self.lookup_str(resource_name) {
+            trace!(%route_name, "computing dynamic Listener");
             let mut snapshot = ResourceSnapshot::new();
             let listener = rds_listener(resource_name.to_string(), route_name.to_string());
             let xds = into_any!(listener);
+            self.inner
+                .listeners
+                .insert(listener.name.clone(), route_name.clone());
+
             snapshot.insert_update(ResourceType::Listener, listener.name, xds);
             let _ = writer.update(snapshot);
         }
@@ -255,13 +263,24 @@ impl crate::xds::SnapshotCallback for RouteIndex {
 }
 
 impl RouteIndex {
-    fn add_explicit(&self, route: &Route) {
+    fn add_explicit(&self, snapshot: &mut ResourceSnapshot, route: &Route) {
         let hostnames = route.hostnames.clone();
         let ports = route.ports.clone();
 
+        // add the explicit route
         self.inner
             .explicit
             .insert(route.id.clone(), (hostnames, ports));
+
+        // remove every Listener that would matches this route and let them get
+        // dynamically recreated.
+        for entry in self.inner.listeners.iter() {
+            let listener_name = entry.key();
+            if matches_route_hostnames_str((&route.hostnames, &route.ports), listener_name) {
+                entry.remove();
+                snapshot.insert_delete(ResourceType::Listener, listener_name.to_string());
+            }
+        }
     }
 
     fn add_implicit(&self, route: &Route) {
@@ -281,6 +300,13 @@ impl RouteIndex {
         self.inner.implicit.remove(name);
     }
 
+    fn lookup_str(&self, name: &str) -> Option<Name> {
+        let (hostname, port) = name.split_once(':')?;
+        let port = port.parse().ok()?;
+
+        self.lookup(hostname, port)
+    }
+
     fn lookup(&self, hostname: &str, port: u16) -> Option<Name> {
         // this is an extremely inefficient linear scan of all of the
         // existing routes. this is fine for ezbake, since we expect to
@@ -289,12 +315,7 @@ impl RouteIndex {
         // walk explicit routes first
         for entry in self.inner.explicit.iter() {
             let (hostnames, ports) = entry.value();
-            // check port match first, it's ez
-            if !(ports.is_empty() || ports.contains(&port)) {
-                continue;
-            }
-
-            if !hostnames.iter().any(|h| h.matches_str(hostname)) {
+            if !matches_route_hostnames((hostnames, ports), hostname, port) {
                 continue;
             }
 
@@ -305,11 +326,7 @@ impl RouteIndex {
         for entry in self.inner.implicit.iter() {
             let (hostnames, ports) = entry.value();
             // check port match first, it's ez
-            if !(ports.is_empty() || ports.contains(&port)) {
-                continue;
-            }
-
-            if !hostnames.iter().any(|h| h.matches_str(hostname)) {
+            if !matches_route_hostnames((hostnames, ports), hostname, port) {
                 continue;
             }
 
@@ -319,6 +336,43 @@ impl RouteIndex {
         // ope nada
         None
     }
+
+    fn reverse_lookup<'a>(
+        &'a self,
+        route: &'a Name,
+    ) -> impl Iterator<Item = Entry<'a, String, Name>> + 'a {
+        self.inner
+            .listeners
+            .iter()
+            .filter(move |e| e.value() == route)
+    }
+}
+
+fn matches_route_hostnames_str(haystack: (&[HostnameMatch], &[u16]), name: &str) -> bool {
+    let Some((hostname, port)) = name.split_once(':') else {
+        return false;
+    };
+    let Ok(port) = port.parse() else {
+        return false;
+    };
+
+    matches_route_hostnames(haystack, hostname, port)
+}
+
+fn matches_route_hostnames(
+    (hostname_matches, port_matches): (&[HostnameMatch], &[u16]),
+    hostname: &str,
+    port: u16,
+) -> bool {
+    if !(port_matches.is_empty() || port_matches.contains(&port)) {
+        return false;
+    }
+
+    if !hostname_matches.iter().any(|h| h.matches_str(hostname)) {
+        return false;
+    }
+
+    true
 }
 
 #[derive(Debug, Default)]
@@ -359,16 +413,24 @@ impl IngestIndex {
     /// On delete, remove the HTTPRoute from the index and remove the route. If
     /// the Route targeted an existing kube Service that now no longer has a
     /// Route, re-generate an implicit one.
+    #[tracing::instrument(skip_all, fields(%route_ref), level = Level::TRACE)]
     fn httproute_changed(
         &mut self,
         snapshot: &mut ResourceSnapshot,
         routes: &Store<HTTPRoute>,
         route_ref: &ObjectRef<HTTPRoute>,
     ) -> Result<(), IngestError> {
+        // FIXME: we're using just the HTTPRoute name as the Route ID which
+        // seems terrible? this is an issue in junction-api too.
+
         match routes.get(route_ref) {
             Some(http_route) => {
+                trace!("updating HTTPRoute");
+
                 let route = Route::from_gateway_httproute(&http_route)?;
-                self.routes.add_explicit(&route);
+
+                // add the explicit route, which deletes any created listeners
+                self.routes.add_explicit(snapshot, &route);
 
                 // TODO: if the Route has ports and explicit hostnames, we
                 // can generate listeners for them ahead of time. don't bother yet.
@@ -378,11 +440,28 @@ impl IngestIndex {
                 snapshot.insert_update(ResourceType::RouteConfiguration, xds_route.name, xds);
             }
             None => {
-                // FIXME: we're using just the HTTPRoute name as the Route ID which seems terrible?
+                trace!("deleting HTTPRoute");
+
                 let route_name = Name::from_str(&route_ref.name).expect(
                     "a valid Kubernetes name should be a valid name. this is a bug in Junction",
                 );
                 self.routes.remove(&route_name);
+                snapshot.insert_delete(ResourceType::RouteConfiguration, route_name.to_string());
+
+                // delete all of the listeners. bump the version on all of the
+                // Routes they point at.
+                let mut touch_routes = BTreeSet::new();
+                for listener_entry in self.routes.reverse_lookup(&route_name) {
+                    let listener_name = listener_entry.key().to_string();
+                    if let Some(name) = self.routes.lookup_str(&listener_name) {
+                        touch_routes.insert(name);
+                    }
+                    snapshot.insert_delete(ResourceType::Listener, listener_name);
+                }
+
+                for name in touch_routes {
+                    snapshot.touch(ResourceType::RouteConfiguration, name.to_string());
+                }
             }
         }
 
@@ -399,6 +478,11 @@ impl IngestIndex {
     ///
     /// Returns `true` if this Service is newly created, so that we can re-trigger
     /// an endpointSlice update.
+    #[tracing::instrument(
+        skip_all,
+        level = Level::TRACE,
+        fields(svc_ref = %svc_ref),
+    )]
     fn service_changed(
         &mut self,
         snapshot: &mut ResourceSnapshot,
@@ -410,6 +494,8 @@ impl IngestIndex {
 
         match svc_store.get(svc_ref).as_ref() {
             Some(svc) => {
+                trace!("updating Service");
+
                 let backends = Backend::from_service(svc)?;
                 let mut old_targets = self.service_backends.remove(svc_ref).unwrap_or_default();
                 let mut new_targets = HashSet::with_capacity(backends.len());
@@ -453,6 +539,8 @@ impl IngestIndex {
                 snapshot.insert_update(ResourceType::RouteConfiguration, implicit_route.name, xds);
             }
             None => {
+                trace!("deleting Service");
+
                 // remove the svc from the index
                 let targets = self.service_backends.remove(svc_ref).unwrap_or_default();
 
@@ -497,6 +585,7 @@ impl IngestIndex {
     // the reverse mapping from `targetPort` back to `port`. Because of this,
     // services_changed calls endpoints_changed every time a service is created
     // from nothing.
+    #[tracing::instrument(skip_all, level = Level::TRACE)]
     fn endpoints_changed<'a, I>(
         &mut self,
         snapshot: &mut ResourceSnapshot,
@@ -512,6 +601,14 @@ impl IngestIndex {
             .map(|svc_ref| (svc_ref, Vec::new()))
             .collect();
 
+        if tracing::enabled!(Level::TRACE) {
+            let services: Vec<_> = svc_slices
+                .keys()
+                .map(|svc_ref| svc_ref.to_string())
+                .collect();
+            trace!(?services, "updating EndpointSlices for Services");
+        }
+
         let all_slices = slice_store.state();
         for slice in all_slices {
             for svc_ref in slice.parent_refs() {
@@ -524,7 +621,6 @@ impl IngestIndex {
         let mut errors = vec![];
         for (svc_ref, slices) in svc_slices {
             let Some(svc) = svc_store.get(svc_ref) else {
-                trace!(%svc_ref, "skipping endpointSlice: Service does not exist");
                 continue;
             };
             let port_lookup = match service_ports(svc_ref, &svc) {
@@ -1130,6 +1226,12 @@ mod test {
             (vec![implicit_route_name(&svc_ref).to_string()], vec![]),
             "should create an implicit RouteConfig"
         );
+
+        // route lookup should still return the route
+        assert_eq!(
+            index.routes.lookup("coolsvc.prod.svc.cluster.local", 80),
+            Some(Name::from_static("cool-example")),
+        );
     }
 
     #[test]
@@ -1328,7 +1430,7 @@ mod test {
         index
             .httproute_changed(&mut snapshot, &route_store, &httproute_ref)
             .unwrap();
-        assert_eq!(index.routes.lookup(lookup_name, 80), route_after_delete,);
+        assert_eq!(index.routes.lookup(lookup_name, 80), route_after_delete);
     }
 
     #[test]
