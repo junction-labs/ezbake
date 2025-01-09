@@ -1,11 +1,5 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    net::SocketAddr,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, str::FromStr};
 
-use crossbeam_skiplist::SkipMap;
 use enum_map::EnumMap;
 use smol_str::{SmolStr, ToSmolStr};
 use tracing::trace;
@@ -17,7 +11,7 @@ use xds_api::pb::envoy::{
 use crate::xds::resources::ResourceType;
 use crate::xds::{cache::SnapshotCache, is_nack};
 
-use super::cache::ResourceVersion;
+use super::{cache::ResourceVersion, server::SubInfo, ResourceNames};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConnectionError {
@@ -31,70 +25,6 @@ pub(crate) enum ConnectionError {
 impl ConnectionError {
     pub(crate) fn into_status(self) -> tonic::Status {
         tonic::Status::invalid_argument(self.to_string())
-    }
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct ConnectionSnapshot {
-    connections: Arc<SkipMap<ConnectionSnapshotKey, AdsConnectionInfo>>,
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ConnectionSnapshotKey {
-    cluster: String,
-    id: String,
-    remote_addr: Option<SocketAddr>,
-}
-
-impl ConnectionSnapshotKey {
-    fn new(node: &xds_node::Node, remote_addr: Option<SocketAddr>) -> Self {
-        Self {
-            id: node.id.clone(),
-            cluster: node.cluster.clone(),
-            remote_addr,
-        }
-    }
-}
-
-pub(crate) struct AdsConnectionInfo {
-    node: xds_node::Node,
-    subscriptions: EnumMap<ResourceType, Option<AdsSubscription>>,
-}
-
-impl ConnectionSnapshot {
-    pub(crate) fn update(&self, conn: &AdsConnection, socket_addr: Option<SocketAddr>) {
-        let key = ConnectionSnapshotKey::new(&conn.node, socket_addr);
-        let node = conn.node.clone();
-
-        self.connections.insert(
-            key,
-            AdsConnectionInfo {
-                node,
-                subscriptions: conn.subscriptions(),
-            },
-        );
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = ConnectionSnapshotEntry> {
-        self.connections.iter().map(ConnectionSnapshotEntry)
-    }
-}
-
-pub(crate) struct ConnectionSnapshotEntry<'a>(
-    crossbeam_skiplist::map::Entry<'a, ConnectionSnapshotKey, AdsConnectionInfo>,
-);
-
-impl ConnectionSnapshotEntry<'_> {
-    pub(crate) fn node(&self) -> &xds_node::Node {
-        &self.0.value().node
-    }
-
-    pub(crate) fn subscriptions(&self) -> impl Iterator<Item = (ResourceType, &AdsSubscription)> {
-        let sub_map = &self.0.value().subscriptions;
-
-        sub_map
-            .iter()
-            .filter_map(|(r, s)| Option::zip(Some(r), s.as_ref()))
     }
 }
 
@@ -164,8 +94,20 @@ impl AdsConnection {
         &self.node
     }
 
-    pub(crate) fn subscriptions(&self) -> EnumMap<ResourceType, Option<AdsSubscription>> {
-        self.subscriptions.clone()
+    pub(crate) fn sent(&self) -> EnumMap<ResourceType, SubInfo> {
+        let mut sent = EnumMap::default();
+
+        for (rtype, sub) in &self.subscriptions {
+            let Some(sub) = sub else {
+                continue;
+            };
+            sent[rtype] = SubInfo {
+                applied: sub.applied,
+                sent: sub.sent.clone(),
+            }
+        }
+
+        sent
     }
 
     pub(crate) fn handle_ads_request(
@@ -362,57 +304,6 @@ impl AdsSubscription {
 fn next_nonce(nonce: &mut u64) -> SmolStr {
     *nonce = nonce.wrapping_add(1);
     nonce.to_smolstr()
-}
-
-/// A set of XDS resource names for tracking connection state.
-///
-/// LDS and CDS have some extra-special wildcard handling that requires
-/// differentiating between two different wildcard states to preserve backwards
-/// compatibility.
-///
-/// https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#how-the-client-specifies-what-resources-to-return
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ResourceNames {
-    EmptyWildcard,
-    Wildcard(BTreeSet<String>),
-    Explicit(BTreeSet<String>),
-}
-
-impl Default for ResourceNames {
-    fn default() -> Self {
-        Self::EmptyWildcard
-    }
-}
-
-impl FromIterator<String> for ResourceNames {
-    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
-        let mut inner = BTreeSet::new();
-        let mut wildcard = false;
-
-        for name in iter {
-            if name == "*" {
-                wildcard = true;
-            } else {
-                inner.insert(name);
-            }
-        }
-
-        if wildcard {
-            Self::Wildcard(inner)
-        } else {
-            Self::Explicit(inner)
-        }
-    }
-}
-
-impl ResourceNames {
-    fn from_names(previous: &Self, names: Vec<String>) -> Self {
-        if names.is_empty() && matches!(previous, Self::EmptyWildcard) {
-            Self::EmptyWildcard
-        } else {
-            Self::from_iter(names)
-        }
-    }
 }
 
 fn snapshot_iter<'n, 's>(
