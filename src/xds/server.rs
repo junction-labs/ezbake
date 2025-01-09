@@ -26,7 +26,7 @@ use crate::{
     xds::{AdsConnection, ResourceType, SnapshotCache},
 };
 
-use super::connection::ConnectionSnapshot;
+use super::{connection::ConnectionSnapshot, delta_connection};
 
 #[derive(Clone)]
 pub(crate) struct AdsServer {
@@ -89,6 +89,125 @@ macro_rules! try_send {
             return;
         }
     };
+}
+
+#[allow(unused, dead_code)]
+#[tracing::instrument(
+    level = "info",
+    skip_all,
+    fields(
+        remote_addr = tracing::field::Empty,
+        node_id = tracing::field::Empty,
+        node_cluster = tracing::field::Empty,
+    )
+)]
+async fn stream_delta_ads(
+    snapshot: SnapshotCache,
+    clients: ConnectionSnapshot,
+    remote_addr: Option<SocketAddr>,
+    mut requests: Streaming<DeltaDiscoveryRequest>,
+    send_response: tokio::sync::mpsc::Sender<Result<DeltaDiscoveryResponse, Status>>,
+) {
+    let _conn_active = crate::metrics::scoped_gauge!("delta_ads.active_connections", 1);
+
+    // ?remote_addr shows us Some(_) when an addr is present and %remote_addr
+    // doesn't compile. this is annoying but do it anyway.
+    if let Some(addr) = remote_addr {
+        Span::current().record("remote_addr", addr.to_string());
+    }
+
+    // save a handle to the snapshot to watch for changes
+    let mut snapshot_changes = snapshot.changes();
+
+    macro_rules! send_xds {
+        ($chan:expr, $message:expr) => {
+            grpc_access::xds_delta_discovery_response(&$message);
+            try_send!($chan, Ok($message));
+            counter!("delta_ads.tx").increment(1);
+        };
+    }
+
+    macro_rules! recv_xds {
+        ($message:expr) => {
+            match $message {
+                Ok(Some(msg)) => {
+                    grpc_access::xds_delta_discovery_request(&msg);
+                    counter!("delta_ads.rx").increment(1);
+                    msg
+                },
+                // the stream has ended
+                Ok(None) => return,
+                // the connection is hosed, just bail
+                Err(e) if io_source(&e).is_some() => {
+                    trace!(err = %e, "closing connection: ignoring io error");
+                    return;
+                },
+                // something actually went wrong!
+                Err(e) => {
+                    warn!(err = %e, "an unexpected error occurred, closing the connection");
+                    return;
+                },
+            }
+        }
+    }
+
+    let mut initial_request = recv_xds!(requests.message().await);
+    let mut conn =
+        match delta_connection::AdsConnection::from_initial_request(&mut initial_request, snapshot)
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                info!(err = %e, "refusing connection: invalid initial request");
+                try_send!(send_response, Err(e.into_status()));
+                return;
+            }
+        };
+
+    let node = conn.node();
+    let current_span = Span::current();
+    current_span.record("node_id", &node.id);
+    current_span.record("node_cluster", &node.cluster);
+
+    conn.handle_ads_request(initial_request);
+
+    let responses = conn.ads_responses();
+    for response in responses {
+        send_xds!(send_response, response);
+    }
+    // TOODO: update client stats
+    // clients.update(&conn, remote_addr);
+
+    loop {
+        // TODO: figure out how to coalesce multiple messages in a reasonable
+        // way here. the right thing is something like "await the first one and
+        // then try to pull out the same events a second-nth time", and to not
+        // use a timer since the timer granularity is so low (like 1ms on
+        // tokio?).
+        tokio::select! {
+            biased;
+
+            resource_type = snapshot_changes.changed() => {
+                conn.handle_snapshot_update(resource_type);
+            },
+            request = requests.message() => {
+                let request = recv_xds!(request);
+                if let Err(e) = conn.handle_ads_request(request) {
+                    info!(node = ?conn.node(), err = %e, "closing connection: invalid request");
+                    try_send!(send_response, Err(e.into_status()));
+                    return;
+                }
+            }
+        }
+
+        let responses = conn.ads_responses();
+        if !responses.is_empty() {
+            for response in responses {
+                send_xds!(send_response, response);
+            }
+            // TODO: update client stats
+            // clients.update(&conn, remote_addr);
+        }
+    }
 }
 
 #[tracing::instrument(

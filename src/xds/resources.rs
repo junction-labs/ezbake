@@ -28,13 +28,16 @@ impl ResourceType {
         }
     }
 
-    #[allow(unused)]
-    pub(crate) fn all() -> &'static [Self] {
+    /// Return a slice of all resource types, ordered according to Envoy's preferred
+    /// make-before-break ordering.
+    ///
+    /// See <https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#xds-protocol-eventual-consistency-considerations>
+    pub(crate) const fn all() -> &'static [Self] {
         &[
-            Self::Listener,
-            Self::RouteConfiguration,
             Self::Cluster,
             Self::ClusterLoadAssignment,
+            Self::Listener,
+            Self::RouteConfiguration,
         ]
     }
 
