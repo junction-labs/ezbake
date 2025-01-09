@@ -51,10 +51,7 @@ impl AdsServer {
 
         grpc_access::xds_discovery_request(&request);
 
-        let Some(snapshot_version) = self.cache.version(resource_type) else {
-            return Err(Status::unavailable("no snapshot available"));
-        };
-
+        let snapshot_version = self.cache.version(resource_type);
         let request_version = request.version_info.parse().ok();
         if request_version == Some(snapshot_version) {
             // TODO: delay/long-poll here? this is what go-control-plane does, but it's odd
