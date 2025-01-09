@@ -220,7 +220,7 @@ impl AdsConnection {
 
         // updates should always go out if the version requested by the client
         // isn't the current version.
-        let out_of_date = request_version != self.snapshot.version(rtype);
+        let out_of_date = request_version != Some(self.snapshot.version(rtype));
 
         // update the current subscription's resource names. if the names have
         // changed replace the current connection's names. send an update if
@@ -257,7 +257,7 @@ impl AdsConnection {
             ?changed_type,
             "snapshot updated",
         );
-        if sub.last_sent_version == self.snapshot.version(changed_type) {
+        if sub.last_sent_version == Some(self.snapshot.version(changed_type)) {
             return Vec::new();
         }
 
@@ -291,10 +291,7 @@ impl AdsSubscription {
         if snapshot.len(rtype) == 0 {
             return Vec::new();
         }
-        let Some(snapshot_version) = snapshot.version(rtype) else {
-            return Vec::new();
-        };
-
+        let snapshot_version = snapshot.version(rtype);
         let iter = snapshot_iter(rtype, &self.names, snapshot);
         let (size_hint, _) = iter.size_hint();
         let mut resources = Vec::with_capacity(size_hint);
@@ -328,12 +325,7 @@ impl AdsSubscription {
         // grab the snapshot version ahead of time in case there's a concurrent
         // update while we're sending. better to be a little behind than a
         // little ahead.
-        //
-        // If the snapshot has no data yet, don't do anything.
-        let Some(snapshot_version) = snapshot.version(rtype) else {
-            return Vec::new();
-        };
-
+        let snapshot_version = snapshot.version(rtype);
         let iter = snapshot_iter(rtype, &self.names, snapshot);
         let (size_hint, _) = iter.size_hint();
 
@@ -805,7 +797,6 @@ mod test {
             resp[0].version_info,
             snapshot
                 .version(ResourceType::ClusterLoadAssignment)
-                .unwrap()
                 .to_string(),
         );
         let next_version = &resp[0].version_info;

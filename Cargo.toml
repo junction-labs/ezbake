@@ -36,3 +36,5 @@ junction-api = { git = "https://github.com/junction-labs/junction-client", featu
     "kube",
     "xds",
 ] }
+crossbeam = "0.8.4"
+svix-ksuid = "0.8.0"
