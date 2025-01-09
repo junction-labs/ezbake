@@ -1,10 +1,15 @@
-use std::{net::SocketAddr, pin::Pin};
+use std::collections::BTreeMap;
+use std::{net::SocketAddr, pin::Pin, sync::Arc};
 
+use crossbeam_skiplist::SkipMap;
+use enum_map::EnumMap;
 use futures::Stream;
 use metrics::counter;
+use smol_str::SmolStr;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, trace, warn, Span};
+use xds_api::pb::envoy::config::core::v3 as xds_node;
 use xds_api::pb::envoy::service::{
     cluster::v3::cluster_discovery_service_server::ClusterDiscoveryService,
     discovery::v3::{
@@ -23,22 +28,22 @@ use xds_api::pb::envoy::service::{
 
 use crate::{
     grpc_access,
-    xds::{AdsConnection, ResourceType, SnapshotCache},
+    xds::{ResourceType, SnapshotCache},
 };
 
-use super::connection::ConnectionSnapshot;
+use super::{delta, sotw};
 
 #[derive(Clone)]
 pub(crate) struct AdsServer {
     cache: SnapshotCache,
-    clients: ConnectionSnapshot,
+    stats: ConnectionSnapshot,
 }
 
 impl AdsServer {
     pub(crate) fn new(cache: SnapshotCache) -> Self {
         Self {
             cache,
-            clients: Default::default(),
+            stats: Default::default(),
         }
     }
 
@@ -91,6 +96,122 @@ macro_rules! try_send {
     };
 }
 
+#[allow(unused, dead_code)]
+#[tracing::instrument(
+    level = "info",
+    skip_all,
+    fields(
+        remote_addr = tracing::field::Empty,
+        node_id = tracing::field::Empty,
+        node_cluster = tracing::field::Empty,
+    )
+)]
+async fn stream_delta_ads(
+    snapshot: SnapshotCache,
+    conn_stats: ConnectionStats,
+    mut requests: Streaming<DeltaDiscoveryRequest>,
+    send_response: tokio::sync::mpsc::Sender<Result<DeltaDiscoveryResponse, Status>>,
+) {
+    let _conn_active = crate::metrics::scoped_gauge!("delta_ads.active_connections", 1);
+
+    // ?remote_addr shows us Some(_) when an addr is present and %remote_addr
+    // doesn't compile. this is annoying but do it anyway.
+    if let Some(addr) = &conn_stats.key.remote_addr {
+        Span::current().record("remote_addr", addr.to_string());
+    }
+
+    // save a handle to the snapshot to watch for changes
+    let mut snapshot_changes = snapshot.changes();
+
+    macro_rules! send_xds {
+        ($chan:expr, $message:expr) => {
+            grpc_access::xds_delta_discovery_response(&$message);
+            try_send!($chan, Ok($message));
+            counter!("delta_ads.tx").increment(1);
+        };
+    }
+
+    macro_rules! recv_xds {
+        ($message:expr) => {
+            match $message {
+                Ok(Some(msg)) => {
+                    grpc_access::xds_delta_discovery_request(&msg);
+                    counter!("delta_ads.rx").increment(1);
+                    msg
+                },
+                // the stream has ended
+                Ok(None) => return,
+                // the connection is hosed, just bail
+                Err(e) if io_source(&e).is_some() => {
+                    trace!(err = %e, "closing connection: ignoring io error");
+                    return;
+                },
+                // something actually went wrong!
+                Err(e) => {
+                    warn!(err = %e, "an unexpected error occurred, closing the connection");
+                    return;
+                },
+            }
+        }
+    }
+
+    let mut initial_request = recv_xds!(requests.message().await);
+    let mut conn = match delta::AdsConnection::from_initial_request(&mut initial_request, snapshot)
+    {
+        Ok(conn) => conn,
+        Err(e) => {
+            info!(err = %e, "refusing connection: invalid initial request");
+            try_send!(send_response, Err(e.into_status()));
+            return;
+        }
+    };
+
+    let node = conn.node();
+    let current_span = Span::current();
+    current_span.record("node_id", &node.id);
+    current_span.record("node_cluster", &node.cluster);
+    conn_stats.update_node(node);
+
+    conn.handle_ads_request(initial_request);
+
+    let responses = conn.ads_responses();
+    for response in responses {
+        send_xds!(send_response, response);
+    }
+    conn_stats.update_subs(conn.sent());
+
+    loop {
+        // TODO: figure out how to coalesce multiple messages in a reasonable
+        // way here. the right thing is something like "await the first one and
+        // then try to pull out the same events a second-nth time", and to not
+        // use a timer since the timer granularity is so low (like 1ms on
+        // tokio?).
+        tokio::select! {
+            biased;
+
+            resource_type = snapshot_changes.changed() => {
+                conn.handle_snapshot_update(resource_type);
+            },
+            request = requests.message() => {
+                let request = recv_xds!(request);
+                if let Err(e) = conn.handle_ads_request(request) {
+                    info!(node = ?conn.node(), err = %e, "closing connection: invalid request");
+                    try_send!(send_response, Err(e.into_status()));
+                    return;
+                }
+            }
+        }
+
+        let responses = conn.ads_responses();
+        if !responses.is_empty() {
+            for response in responses {
+                send_xds!(send_response, response);
+            }
+            conn_stats.update_subs(conn.sent());
+        }
+    }
+}
+
 #[tracing::instrument(
     level = "info",
     skip_all,
@@ -102,8 +223,7 @@ macro_rules! try_send {
 )]
 async fn stream_ads(
     snapshot: SnapshotCache,
-    clients: ConnectionSnapshot,
-    remote_addr: Option<SocketAddr>,
+    conn_stats: ConnectionStats,
     mut requests: Streaming<DiscoveryRequest>,
     send_response: tokio::sync::mpsc::Sender<Result<DiscoveryResponse, Status>>,
 ) {
@@ -111,7 +231,7 @@ async fn stream_ads(
 
     // ?remote_addr shows us Some(_) when an addr is present and %remote_addr
     // doesn't compile. this is annoying but do it anyway.
-    if let Some(addr) = remote_addr {
+    if let Some(addr) = &conn_stats.key.remote_addr {
         Span::current().record("remote_addr", addr.to_string());
     }
 
@@ -153,7 +273,7 @@ async fn stream_ads(
     // pull the Node out of the initial request and add the current node info to
     // the current span so we can forget about it for the rest of the stream.
     let mut initial_request = recv_xds!(requests.message().await);
-    let mut conn = match AdsConnection::from_initial_request(&mut initial_request, snapshot) {
+    let mut conn = match sotw::AdsConnection::from_initial_request(&mut initial_request, snapshot) {
         Ok(conn) => conn,
         Err(e) => {
             info!(err = %e, "refusing connection: invalid initial request");
@@ -182,7 +302,7 @@ async fn stream_ads(
     for response in responses {
         send_xds!(send_response, response);
     }
-    clients.update(&conn, remote_addr);
+    conn_stats.update_subs(conn.sent());
 
     // respond to either an incoming request or a snapshot update until the client
     // goes away.
@@ -208,7 +328,7 @@ async fn stream_ads(
         for response in responses {
             send_xds!(send_response, response);
         }
-        clients.update(&conn, remote_addr);
+        conn_stats.update_subs(conn.sent());
     }
 }
 
@@ -242,27 +362,34 @@ impl AggregatedDiscoveryService for AdsServer {
         request: Request<Streaming<DiscoveryRequest>>,
     ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
         let remote_addr = request.remote_addr();
+        let local_addr = request.local_addr();
+        let conn_stats = self.stats.new_connection("sotw", remote_addr, local_addr);
 
         let requests = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
 
-        tokio::spawn(stream_ads(
-            self.cache.clone(),
-            self.clients.clone(),
-            remote_addr,
-            requests,
-            tx,
-        ));
+        tokio::spawn(stream_ads(self.cache.clone(), conn_stats, requests, tx));
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn delta_aggregated_resources(
         &self,
-        _request: Request<Streaming<DeltaDiscoveryRequest>>,
+        request: Request<Streaming<DeltaDiscoveryRequest>>,
     ) -> std::result::Result<tonic::Response<Self::DeltaAggregatedResourcesStream>, Status> {
-        return Err(Status::unimplemented(
-            "ezbake does not support Incremental ADS",
+        let remote_addr = request.remote_addr();
+        let local_addr = request.local_addr();
+        let conn_stats = self.stats.new_connection("delta", remote_addr, local_addr);
+
+        let requests = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+        tokio::spawn(stream_delta_ads(
+            self.cache.clone(),
+            conn_stats,
+            requests,
+            tx,
         ));
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
@@ -372,27 +499,12 @@ impl ClientStatusDiscoveryService for AdsServer {
         }
 
         let mut config = vec![];
-        for conn_snapshot in self.clients.iter() {
+        for conn_stats in self.stats.iter() {
             let mut generic_xds_configs = vec![];
 
-            let node = conn_snapshot.node().clone();
-            for (rtype, sub_state) in conn_snapshot.subscriptions() {
-                let type_url = rtype.type_url();
-                let config_status = if sub_state.applied {
-                    ConfigStatus::Synced
-                } else {
-                    ConfigStatus::Error
-                };
-
-                for (name, version) in &sub_state.sent {
-                    generic_xds_configs.push(GenericXdsConfig {
-                        type_url: type_url.to_string(),
-                        name: name.to_string(),
-                        version_info: version.to_string(),
-                        config_status: config_status.into(),
-                        ..Default::default()
-                    });
-                }
+            let node = conn_stats.node().clone();
+            for (rtype, subs) in conn_stats.subscriptions() {
+                generic_xds_configs.extend(subs.to_generic_xds_config(rtype));
             }
 
             config.push(ClientConfig {
@@ -403,5 +515,135 @@ impl ClientStatusDiscoveryService for AdsServer {
         }
 
         Ok(Response::new(ClientStatusResponse { config }))
+    }
+}
+
+// an Arc'd map of connection stats
+#[derive(Clone, Default)]
+struct ConnectionSnapshot {
+    connections: Arc<SkipMap<ConnKey, ConnInfo>>,
+}
+
+impl ConnectionSnapshot {
+    fn new_connection(
+        &self,
+        proto: &'static str,
+        remote_addr: Option<SocketAddr>,
+        local_addr: Option<SocketAddr>,
+    ) -> ConnectionStats {
+        ConnectionStats {
+            connections: self.connections.clone(),
+            key: ConnKey {
+                protocol: proto,
+                remote_addr,
+                local_addr,
+            },
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = ConnectionSnapshotEntry> + '_ {
+        self.connections.iter().map(ConnectionSnapshotEntry)
+    }
+}
+
+pub(crate) struct ConnectionSnapshotEntry<'a>(
+    crossbeam_skiplist::map::Entry<'a, ConnKey, ConnInfo>,
+);
+
+impl ConnectionSnapshotEntry<'_> {
+    pub(crate) fn node(&self) -> &xds_node::Node {
+        &self.0.value().node
+    }
+
+    pub(crate) fn subscriptions(&self) -> &EnumMap<ResourceType, SubInfo> {
+        &self.0.value().subscriptions
+    }
+}
+
+// an RAII stats counter for an individual connection
+struct ConnectionStats {
+    connections: Arc<SkipMap<ConnKey, ConnInfo>>,
+    key: ConnKey,
+}
+
+impl Drop for ConnectionStats {
+    fn drop(&mut self) {
+        self.connections.remove(&self.key);
+    }
+}
+
+// a key to uniquely identify a connection
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ConnKey {
+    protocol: &'static str,
+    remote_addr: Option<SocketAddr>,
+    local_addr: Option<SocketAddr>,
+}
+
+impl ConnectionStats {
+    fn update_node(&self, node: &xds_node::Node) {
+        let subscriptions = match self.connections.get(&self.key) {
+            Some(e) => e.value().subscriptions.clone(),
+            None => Default::default(),
+        };
+
+        self.connections.insert(
+            self.key.clone(),
+            ConnInfo {
+                node: node.clone(),
+                subscriptions,
+            },
+        );
+    }
+
+    fn update_subs(&self, subscriptions: EnumMap<ResourceType, SubInfo>) {
+        let node = self
+            .connections
+            .get(&self.key)
+            .map(|e| e.value().node.clone())
+            .unwrap_or_default();
+
+        self.connections.insert(
+            self.key.clone(),
+            ConnInfo {
+                node,
+                subscriptions,
+            },
+        );
+    }
+}
+
+// protocol-based connection info. agnostic to sotw vs. delta so we can use csds
+// for both.
+struct ConnInfo {
+    node: xds_node::Node,
+    subscriptions: EnumMap<ResourceType, SubInfo>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SubInfo {
+    pub(crate) applied: bool,
+    pub(crate) sent: BTreeMap<SmolStr, SmolStr>,
+}
+
+impl SubInfo {
+    fn to_generic_xds_config(&self, rtype: ResourceType) -> Vec<GenericXdsConfig> {
+        let type_url = rtype.type_url();
+        let config_status = match self.applied {
+            true => ConfigStatus::Synced,
+            false => ConfigStatus::Error,
+        };
+        let configs = self.sent.iter().map(|(name, version)| {
+            let name = name.to_string();
+            let version_info = version.to_string();
+            GenericXdsConfig {
+                type_url: type_url.to_string(),
+                name,
+                version_info,
+                config_status: config_status.into(),
+                ..Default::default()
+            }
+        });
+        configs.collect()
     }
 }

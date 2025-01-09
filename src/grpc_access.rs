@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use tower_http::classify::GrpcFailureClass;
 use tracing::{info_span, Span};
-use xds_api::pb::envoy::service::discovery::v3::DiscoveryResponse;
+use xds_api::pb::envoy::service::discovery::v3::{
+    DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryResponse,
+};
 
 macro_rules! layer {
     () => {
@@ -82,6 +84,27 @@ pub(crate) fn xds_discovery_response(response: &DiscoveryResponse) {
         n = response.nonce,
         ty = response.type_url,
         r_count = response.resources.len(),
+        "DiscoveryResponse",
+    );
+}
+pub(crate) fn xds_delta_discovery_request(request: &DeltaDiscoveryRequest) {
+    tracing::info!(
+        n = request.response_nonce,
+        ty = request.type_url,
+        r = ?request.resource_names_subscribe,
+        init = ?request.initial_resource_versions,
+        error_code = request.error_detail.as_ref().map(|e| e.code),
+        error_message = request.error_detail.as_ref().map(|e| &e.message),
+        "DeltaDiscoveryRequest",
+    );
+}
+
+pub(crate) fn xds_delta_discovery_response(response: &DeltaDiscoveryResponse) {
+    tracing::info!(
+        n = response.nonce,
+        ty = response.type_url,
+        added = response.resources.len(),
+        removed = response.removed_resources.len(),
         "DiscoveryResponse",
     );
 }
