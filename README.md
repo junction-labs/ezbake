@@ -15,7 +15,7 @@ gateway API config in the cluster.
 
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/experimental-install.yaml
-kubectl apply -f https://github.com/junction-labs/ezbake/releases/latest/download/install-for-cluster.yaml
+kubectl apply -f https://github.com/junction-labs/ezbake/releases/latest/download/install-for-cluster.yml
 ```
 
 Now, to communicate with ezbake, all clients will need the `JUNCTION_ADS_SERVER` environment 
@@ -46,7 +46,7 @@ To uninstall, run `kubectl delete` on the Gateway APIs and the objects that
 `ezbake` installed:
 
 ```bash
-kubectl delete -f https://github.com/junction-labs/ezbake/releases/latest/download/install-for-cluster.yaml
+kubectl delete -f https://github.com/junction-labs/ezbake/releases/latest/download/install-for-cluster.yml
 kubectl delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/experimental-install.yaml
 ```
 
