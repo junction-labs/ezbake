@@ -11,9 +11,6 @@ on:
         type: string
         default: latest
 
-permissions:
-  contents: write # This is required to create/push the new git tag
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -27,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
+      contents: write
       packages: write
       id-token: write
 
