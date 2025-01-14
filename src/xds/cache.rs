@@ -102,7 +102,7 @@ impl ResourceSnapshot {
         resources
             .keys()
             .cloned()
-            .partition(|k| resources.get(k).map_or(false, |v| v.is_some()))
+            .partition(|k| resources.get(k).is_some_and(|v| v.is_some()))
     }
 }
 
