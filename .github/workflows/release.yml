@@ -1,0 +1,72 @@
+name: Publish Docker Image and YAMLs
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Git Commit SHA. Use the latest commit on main if left blank.
+        type: string
+      tag:
+        description: The version tag of the release, of the form "v1.2.3". Use "latest" if it is a dry-run.
+        type: string
+        default: latest
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  release-artifacts:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: "Checkout GitHub Action"
+        uses: actions/checkout@main
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.7.1
+
+      - name: "Login to Registry"
+        uses: docker/login-action@v1
+        with:
+          registry: ${{env.REGISTRY}}
+          username: ${{github.actor}}
+          password: ${{secrets.GITHUB_TOKEN}}
+
+      - name: "Build and Publish Image"
+        run: |
+          docker buildx build --file ./scripts/Dockerfile-multiarch  \
+                       --platform=linux/arm64,linux/amd64 \
+                       --push \
+                       --tag ${{env.REGISTRY}}/junction-labs/${{env.IMAGE_NAME}}:${{inputs.tag}} \
+                       .
+
+      - name: "Update container tag in YAML"
+        run: |
+          echo ${{ github.sha }} > release.txt
+          sed -i "s/latest/$${{inputs.tag}}" scripts/install-for-cluster.yaml
+          sed -i "s/latest/$${{inputs.tag}}" scripts/install-for-namespace.yaml
+
+      - name: Release
+        if: ${{ ! contains(inputs.tag, 'latest') }}
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v0.1.15
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: |
+            release.txt
+            scripts/install-for-cluster.yaml
+            scripts/install-for-namespace.yaml
+            scripts/install-for-namespace-admin.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

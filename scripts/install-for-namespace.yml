@@ -19,8 +19,8 @@ spec:
       containers:
         - name: ezbake
           command: ["./ezbake"]
-          image: ezbake:latest
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/junction-labs/junction-labs/ezbake:latest
+          imagePullPolicy: Always
           env:
             - name: RUST_LOG
               value: "ezbake=trace,warn"
