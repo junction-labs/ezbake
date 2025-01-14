@@ -928,7 +928,7 @@ fn endpoint_slice_ports(slice: &discovery_v1::EndpointSlice) -> Vec<(String, u16
 }
 
 fn is_endpoint_ready(endpoint: &discovery_v1::Endpoint) -> bool {
-    endpoint.conditions.as_ref().map_or(false, |conditions| {
+    endpoint.conditions.as_ref().is_some_and(|conditions| {
         let ready = conditions.ready.unwrap_or(false);
         conditions.serving.unwrap_or(ready)
     })
