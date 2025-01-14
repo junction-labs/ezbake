@@ -1,4 +1,4 @@
-name: Publish Docker Image and YAMLs
+name: Publish Github Release
 
 on:
   workflow_dispatch:
@@ -10,6 +10,9 @@ on:
         description: The version tag of the release, of the form "v1.2.3". Use "latest" if it is a dry-run.
         type: string
         default: latest
+
+permissions:
+  contents: write # This is required to create/push the new git tag
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
