@@ -55,8 +55,8 @@ jobs:
       - name: "Update container tag in YAML"
         run: |
           echo ${{ github.sha }} > release.txt
-          sed -i "s/latest/$${{inputs.tag}}" scripts/install-for-cluster.yaml
-          sed -i "s/latest/$${{inputs.tag}}" scripts/install-for-namespace.yaml
+          sed -i "s/ezbake:latest/ezbake:$${{inputs.tag}}/g" scripts/install-for-cluster.yml
+          sed -i "s/ezbake:latest/ezbake:$${{inputs.tag}}/g" scripts/install-for-namespace.yml
 
       - name: Release
         if: ${{ ! contains(inputs.tag, 'latest') }}
@@ -65,8 +65,8 @@ jobs:
           tag_name: ${{ inputs.tag }}
           files: |
             release.txt
-            scripts/install-for-cluster.yaml
-            scripts/install-for-namespace.yaml
-            scripts/install-for-namespace-admin.yaml
+            scripts/install-for-cluster.yml
+            scripts/install-for-namespace.yml
+            scripts/install-for-namespace-admin.yml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
