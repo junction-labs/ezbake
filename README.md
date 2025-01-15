@@ -1,10 +1,17 @@
-# `ezbake`: A simple xDS control-plane for Junction.
+# `ezbake`
 
-## About
+A simple xDS control-plane for Junction.
 
-`ezbake` is a simple xDS control plane for Junction. `ezbake` runs in a
-Kubernetes cluster, watches its running services, and creates appropriate xds
-configuration.
+## What is it?
+
+[ezbake] is a simple [xDS] control plane for
+Junction, which uses the [gateway_api] to support dynamic configuration.
+`ezbake` runs in a Kubernetes cluster, watches its running services, and runs
+as an xDS control plane to drive the Junction client.
+
+[ezbake]: https://github.com/junction-labs/ezbake
+[gateway_api]: https://gateway-api.sigs.k8s.io/
+[xDS]: https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol
 
 ### Installing
 
