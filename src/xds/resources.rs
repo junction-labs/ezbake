@@ -28,6 +28,10 @@ impl ResourceType {
         }
     }
 
+    pub(crate) const fn supports_wildcard(&self) -> bool {
+        matches!(self, ResourceType::Cluster | ResourceType::Listener)
+    }
+
     /// Return a slice of all resource types, ordered according to Envoy's preferred
     /// make-before-break ordering.
     ///

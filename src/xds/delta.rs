@@ -56,6 +56,11 @@ pub(crate) struct AdsSubscription {
     /// whether or not the client applied the last response
     applied: bool,
 
+    /// the set of resources the client is subcribed to. this is be a superset
+    /// of the keyset of sent - it includes anything we've sent to the client,
+    /// and any resources the client is interested in that don't exist yet.
+    subscribed: BTreeSet<SmolStr>,
+
     // the last version of each resource sent back to the client
     sent: BTreeMap<SmolStr, SmolStr>,
 
@@ -63,9 +68,14 @@ pub(crate) struct AdsSubscription {
     // be rescanned.
     changed: bool,
 
-    // the set of resources that need updates, whether or not the version
-    // of the resources in cache has changed.
-    pending: BTreeSet<SmolStr>,
+    // the set of resources that need an update, whether or not the version of
+    // the resources in cache has changed.
+    sync: BTreeSet<SmolStr>,
+
+    // the set of names that have been removed while in wildcard mode. if the
+    // removed resource is part of the wildcard, we have to force re-send it,
+    // otherwise we do another round of remove/ack with the client
+    remove_wildcard: BTreeSet<SmolStr>,
 }
 
 impl AdsConnection {
@@ -127,7 +137,8 @@ impl AdsConnection {
 
         // get and clear subscription state. we should no longer have to touch
         // the subscription.
-        let mut pending = std::mem::take(&mut sub.pending);
+        let mut sync = std::mem::take(&mut sub.sync);
+        let remove_wildcard = std::mem::take(&mut sub.remove_wildcard);
         let changed = sub.changed;
         sub.changed = false;
 
@@ -143,28 +154,26 @@ impl AdsConnection {
         let mut resources = vec![];
         let mut removed_resources = vec![];
 
-        // TODO: handle a wildcard update for this node. right now we ignore
-        // the fact that a subscription is in wildcard mode (which is legal!)
-        // but this is where we should be looking up default resources for
-        // this node and shipping them back.
-        // if sub.is_wildcard {
-        //    self.send_defaults(node)
-        //  }
+        // TODO: actually check to see if there are wildcard resources for this
+        // node. right now we assume there are never any.
+        //
+        // if there are, we have to combine them with the sent map somehow and
+        // have to do the remove check differently.
+        removed_resources.extend(remove_wildcard.into_iter().map(|s| s.into()));
 
         if changed {
-            for (name, last_version) in &sub.sent {
+            // TODO: include wildcard resources here
+            for name in &sub.subscribed {
                 // if we're already sending an update because the version
-                // changed, we don't need to do it again.
-                //
-                // since we're checking here we have to honor the pending set.
-                // if something was found, don't do a version check.
-                let is_pending = pending.remove(name);
-
+                // changed, we don't need to do it again, and if we're forcing
+                // this, just do it anyway.
+                let force = sync.remove(name);
+                let last_version = sub.sent.get(name);
                 match self.snapshot.get(rtype, name) {
                     Some(entry) => {
                         let VersionedProto { version, proto } = entry.value();
 
-                        if is_pending || &version.to_smolstr() != last_version {
+                        if force || Some(&version.to_smolstr()) != last_version {
                             resources.push(Resource {
                                 name: name.to_string(),
                                 version: version.to_string(),
@@ -183,7 +192,7 @@ impl AdsConnection {
         }
 
         // grab all pending names and send em as well
-        for name in pending {
+        for name in sync {
             match self.snapshot.get(rtype, &name) {
                 Some(entry) => {
                     let name = entry.key();
@@ -198,6 +207,7 @@ impl AdsConnection {
                     to_update.insert(name.to_smolstr(), version.to_smolstr());
                 }
                 None => {
+                    removed_resources.push(name.to_string());
                     to_remove.insert(name);
                 }
             }
@@ -273,7 +283,10 @@ impl AdsConnection {
                 let initial_resource_versions =
                     std::mem::take(&mut request.initial_resource_versions);
                 for (name, version) in initial_resource_versions {
-                    sub.sent.insert(name.to_smolstr(), version.to_smolstr());
+                    let name = name.to_smolstr();
+                    let version = version.to_smolstr();
+                    sub.subscribed.insert(name.clone());
+                    sub.sent.insert(name, version);
                 }
                 sub.changed = true;
                 sub.applied = true;
@@ -319,9 +332,6 @@ impl AdsConnection {
             }
         };
 
-        // handle subscribes and unsubscribes by adding/removing from the pending set
-        // and from history.
-        //
         // on subscribing, we register a name as pending *even if* it's already in the
         // sent set with the same version as is in cache, per the protocol.
         for name in request.resource_names_subscribe {
@@ -329,12 +339,23 @@ impl AdsConnection {
                 sub.is_wildcard = true;
                 continue;
             }
-            sub.pending.insert(name.to_smolstr());
+            let name = name.to_smolstr();
+            sub.remove_wildcard.remove(&name);
+            sub.subscribed.insert(name.clone());
+            sub.sync.insert(name);
         }
+        // on unsubscribing, clear out all of the state for this name. if the
+        // sub is currently in wildcard mode, toss it in the pile for special
+        // handling on the next outgoing message.
         for name in request.resource_names_unsubscribe {
             let name = name.to_smolstr();
-            sub.pending.remove(&name);
+            sub.subscribed.remove(&name);
+            sub.sync.remove(&name);
             sub.sent.remove(&name);
+
+            if rtype.supports_wildcard() && sub.is_wildcard {
+                sub.remove_wildcard.insert(name);
+            }
         }
 
         Ok(())
@@ -369,6 +390,9 @@ mod test {
     use xds_api::pb::google::protobuf;
 
     macro_rules! request {
+        ($rypte:expr) => {
+            request($rypte, None, vec![], vec![], vec![], None)
+        };
         ($rypte:expr, init = $init:expr) => {
             request($rypte, None, $init, vec![], vec![], None)
         };
@@ -403,10 +427,11 @@ mod test {
             ..Default::default()
         };
 
-        // with no init and new subscriptions, should not respond
+        // with new wildcard subscription should not respond
         let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
-        conn.handle_ads_request(request!(ResourceType::Listener, add = vec!["example.com"]))
+        conn.handle_ads_request(request!(ResourceType::Listener))
             .unwrap();
+        // with an explicit subscription to missing, should NACK
         conn.handle_ads_request(request!(ResourceType::Cluster, add = vec!["example.com"]))
             .unwrap();
         // with initial versions, should respond with a removal
@@ -415,18 +440,23 @@ mod test {
             init = vec![("bar.com", "v2")]
         ))
         .unwrap();
-        // an empty message is useless and should do nothing!
-        conn.handle_ads_request(request!(ResourceType::ClusterLoadAssignment, init = vec![]))
+        // new empty non-wildcard subscription, shouldn't respond. technically invalid?
+        conn.handle_ads_request(request!(ResourceType::ClusterLoadAssignment))
             .unwrap();
 
-        // the only response should be the RDS response
+        // should generate a CDS not-found and an RDS delete
         let responses = conn.ads_responses();
-        assert_eq!(responses.len(), 1);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].type_url, ResourceType::Cluster.type_url());
         assert_eq!(
-            responses[0].type_url,
+            responses[0].removed_resources,
+            vec!["example.com".to_string()]
+        );
+        assert_eq!(
+            responses[1].type_url,
             ResourceType::RouteConfiguration.type_url()
         );
-        assert_eq!(responses[0].removed_resources, vec!["bar.com".to_string()]);
+        assert_eq!(responses[1].removed_resources, vec!["bar.com".to_string()]);
     }
 
     #[test]
@@ -638,6 +668,138 @@ mod test {
     }
 
     #[test]
+    fn test_lds_remove_subscription() {
+        let node = xds_core::Node {
+            id: "test-node".to_string(),
+            ..Default::default()
+        };
+        let (_, snapshot) = new_snapshot([(ResourceType::Listener, vec!["nginx.example.com"])]);
+
+        // send a request for a new subscription
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        conn.handle_ads_request(request!(
+            ResourceType::Listener,
+            add = vec!["nginx.example.com"]
+        ))
+        .unwrap();
+
+        // should respond with the data and treat the resource as subscribed.
+        let resp = conn.ads_responses();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(resp[0].type_url, ResourceType::Listener.type_url());
+        assert_eq!(resp[0].resources.len(), 1);
+        let sub = conn.subscriptions[ResourceType::Listener].as_ref().unwrap();
+        assert!(sub.sent.contains_key("nginx.example.com"));
+
+        // handle the ACK
+        conn.handle_ads_request(request!(ResourceType::Listener, n = &resp[0].nonce))
+            .unwrap();
+        let resp = conn.ads_responses();
+        assert!(resp.is_empty());
+
+        // send an unsubcribe to the server
+        conn.handle_ads_request(request!(
+            ResourceType::Listener,
+            remove = vec!["nginx.example.com"]
+        ))
+        .unwrap();
+
+        // server should not generate a response, but should unsubscribe the
+        // client.
+        assert!(conn.ads_responses().is_empty());
+        let sub = conn.subscriptions[ResourceType::Listener].as_ref().unwrap();
+        assert!(!sub.sent.contains_key("nginx.example.com"));
+    }
+
+    #[test]
+    fn test_lds_remove_subscription_wildcard() {
+        let node = xds_core::Node {
+            id: "test-node".to_string(),
+            ..Default::default()
+        };
+        let (_, snapshot) = new_snapshot([(ResourceType::Listener, vec!["nginx.example.com"])]);
+
+        // send a request for a new subscription
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        conn.handle_ads_request(request!(
+            ResourceType::Listener,
+            add = vec!["*", "nginx.example.com"]
+        ))
+        .unwrap();
+
+        // should respond with the data and treat the resource as subscribed as well as part
+        // of the wildcard.
+        let resp = conn.ads_responses();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(resp[0].type_url, ResourceType::Listener.type_url());
+        assert_eq!(resp[0].resources.len(), 1);
+        let sub = conn.subscriptions[ResourceType::Listener].as_ref().unwrap();
+        assert!(sub.is_wildcard);
+        assert!(sub.sent.contains_key("nginx.example.com"));
+
+        // handle the ACK
+        conn.handle_ads_request(request!(ResourceType::Listener, n = &resp[0].nonce))
+            .unwrap();
+        let resp = conn.ads_responses();
+        assert!(resp.is_empty());
+
+        // send an unsubcribe to the server
+        conn.handle_ads_request(request!(
+            ResourceType::Listener,
+            remove = vec!["nginx.example.com"]
+        ))
+        .unwrap();
+
+        // server should generate a response to indicate that the resource was not part
+        // of the wildcard.
+        let resp = conn.ads_responses();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(resp[0].type_url, ResourceType::Listener.type_url());
+        assert_eq!(resp[0].removed_resources, vec!["nginx.example.com"]);
+    }
+
+    #[test]
+    fn test_lds_not_found() {
+        let node = xds_core::Node {
+            id: "test-node".to_string(),
+            ..Default::default()
+        };
+
+        let (_, snapshot, mut writer) =
+            new_snapshot_with_writer([(ResourceType::Listener, vec!["nginx.example.com"])]);
+
+        // send a request
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        conn.handle_ads_request(request!(
+            ResourceType::Listener,
+            add = vec!["new.example.com"]
+        ))
+        .unwrap();
+
+        // should return a not-found
+        let resp = conn.ads_responses();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(resp[0].type_url, ResourceType::Listener.type_url());
+        assert_eq!(resp[0].removed_resources, vec!["new.example.com"]);
+
+        // update the snapshot with the new resource
+        let mut snapshot = ResourceSnapshot::new();
+        snapshot.insert_update(
+            ResourceType::Listener,
+            "new.example.com".to_string(),
+            anything(),
+        );
+        let next_version = writer.update(snapshot);
+        conn.handle_snapshot_update(ResourceType::Listener);
+
+        let resp = conn.ads_responses();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(resp[0].type_url, ResourceType::Listener.type_url(),);
+        assert_eq!(resp[0].resources[0].name, "new.example.com");
+        assert_eq!(resp[0].resources[0].version, next_version.to_string());
+    }
+
+    #[test]
     fn test_cds_handle_ack_as_update() {
         let node = xds_core::Node {
             id: "test-node".to_string(),
@@ -665,7 +827,7 @@ mod test {
         let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
         conn.handle_ads_request(request!(
             ResourceType::Cluster,
-            init = vec![("nginx.default.svc.cluster.local:80", "111.222")]
+            init = vec![("nginx.default.svc.cluster.local:80", "old-version-number")]
         ))
         .unwrap();
 
@@ -790,6 +952,70 @@ mod test {
     }
 
     #[test]
+    fn test_eds_not_found() {
+        let node = xds_core::Node {
+            id: "test-node".to_string(),
+            ..Default::default()
+        };
+
+        let (version, snapshot, mut writer) = new_snapshot_with_writer([(
+            ResourceType::ClusterLoadAssignment,
+            vec![
+                "nginx.default.svc.cluster.local:80",
+                "nginx-staging.default.svc.cluster.local:80",
+            ],
+        )]);
+
+        let mut conn = AdsConnection::test_new(node.clone(), snapshot.clone());
+        conn.handle_ads_request(request!(
+            ResourceType::ClusterLoadAssignment,
+            init = vec![("nginx.default.svc.cluster.local:80", &version.to_string())]
+        ))
+        .unwrap();
+        assert!(conn.ads_responses().is_empty());
+
+        // ask for something that does not exist
+        conn.handle_ads_request(request!(
+            ResourceType::ClusterLoadAssignment,
+            add = vec!["nginx-next.default.svc.cluster.local:80"]
+        ))
+        .unwrap();
+
+        let resp = conn.ads_responses();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(
+            resp[0].type_url,
+            ResourceType::ClusterLoadAssignment.type_url()
+        );
+        assert_eq!(
+            resp[0].removed_resources,
+            vec!["nginx-next.default.svc.cluster.local:80"],
+        );
+
+        // create the resource and check that we now send an update for it.
+        let mut snapshot = ResourceSnapshot::new();
+        snapshot.insert_update(
+            ResourceType::ClusterLoadAssignment,
+            "nginx-next.default.svc.cluster.local:80".to_string(),
+            anything(),
+        );
+        let next_version = writer.update(snapshot);
+        conn.handle_snapshot_update(ResourceType::ClusterLoadAssignment);
+
+        let resp = conn.ads_responses();
+        assert_eq!(resp.len(), 1);
+        assert_eq!(
+            resp[0].type_url,
+            ResourceType::ClusterLoadAssignment.type_url(),
+        );
+        assert_eq!(
+            resp[0].resources[0].name,
+            "nginx-next.default.svc.cluster.local:80",
+        );
+        assert_eq!(resp[0].resources[0].version, next_version.to_string());
+    }
+
+    #[test]
     fn test_eds_add_remove_add() {
         let node = xds_core::Node {
             id: "test-node".to_string(),
@@ -908,7 +1134,7 @@ mod test {
         .unwrap();
 
         // should not respond on a remove
-        assert!(conn.ads_responses().is_empty());
+        assert_eq!(conn.ads_responses(), vec![]);
     }
 
     #[test]
