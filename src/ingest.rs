@@ -549,6 +549,7 @@ impl IngestIndex {
                 for target in &targets {
                     snapshot.insert_delete(ResourceType::Cluster, target.name());
                     snapshot.insert_delete(ResourceType::Listener, target.lb_config_route_name());
+                    snapshot.insert_delete(ResourceType::ClusterLoadAssignment, target.name());
                 }
 
                 let route_name = implicit_route_name(svc_ref);
